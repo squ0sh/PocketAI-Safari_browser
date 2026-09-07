@@ -75,17 +75,25 @@ const MODELS = [
     runtime: "bitgpu",
     manifestUrl:
       "https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.19.1/models/bonsai-27b-gguf/manifest.json",
-    auxUrl:
-      "https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.19.1/models/bonsai-27b-gguf/Bonsai-27B-Q1_0.aux.bin",
-    dataUrl:
-      "https://huggingface.co/prism-ml/Bonsai-27B-Q1_0.gguf",
+    auxUrl:
+      "https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.19.1/models/bonsai-27b-gguf/Bonsai-27B-Q1_0.aux.bin",
+    dataUrl:
+      "https://huggingface.co/prism-ml/Bonsai-27B-gguf/resolve/main/Bonsai-27B-Q1_0.gguf",
     tokenizerJsonUrl:
       "https://huggingface.co/prism-ml/Bonsai-27B-unpacked/resolve/main/tokenizer.json",
-    tokenizerConfigUrl:
-      "https://huggingface.co/prism-ml/Bonsai-27B-unpacked/resolve/main/tokenizer_config.json",
-    maxSeqLen: 2048,
-    kvCache: "q8",
-  },
+    tokenizerConfigUrl:
+      "https://huggingface.co/prism-ml/Bonsai-27B-unpacked/resolve/main/tokenizer_config.json",
+    maxSeqLen: 2048,
+    kvCache: "q8",
+    generation: { temperature: 0.5, topP: 0.85, topK: 20 },
+  },
+  {
+    id: "online-assist",
+    name: "Online Assist",
+    tier: "Cloud",
+    description: "Current information via your private FreeLLM proxy.",
+    runtime: "online",
+  },
 ];
 
 const KEY = "pocket-ai-selected-model-v4";
@@ -104,6 +112,7 @@ const $ = (s) => document.querySelector(s);
 
 const chat = $("#chat");
 const welcome = $("#welcome");
+const welcomeCopy = welcome.querySelector("p");
 const load = $("#loadButton");
 const modelButton = $("#modelButton");
 const sheet = $("#modelSheet");
@@ -120,7 +129,29 @@ const drawer = $("#historyDrawer");
 const backdrop = $("#drawerBackdrop");
 
 function model() {
-  return MODELS.find((x) => x.id === selected) || MODELS[0];
+  return MODELS.find((x) => x.id === selected) || MODELS[0];
+}
+
+function isOnlineModel(m = model()) {
+  return m.runtime === "online";
+}
+
+function updateWelcome() {
+  const online = isOnlineModel();
+
+  welcomeCopy.textContent = online
+    ? "Online Assist sends this chat to your configured AI service for current information."
+    : "Models run directly on the device GPU. Your chat is not sent to an AI API.";
+
+  load.textContent = online
+    ? "Connect Online Assist"
+    : "Load Local AI";
+
+  if (!engine) {
+    status.textContent = online
+      ? "Online Assist · not connected"
+      : "Local AI · WebLLM not loaded";
+  }
 }
 
 function renderModels() {
@@ -151,8 +182,9 @@ function renderModels() {
       selected = m.id;
       localStorage.setItem(KEY, selected);
 
-      modelButton.textContent = m.name;
-      sheet.classList.remove("open");
+      modelButton.textContent = m.name;
+      sheet.classList.remove("open");
+      updateWelcome();
 
       if (engine) {
         location.reload();
@@ -385,29 +417,36 @@ async function loadModel() {
   progressWrap.hidden = false;
   progress.style.width = "0%";
 
-  /*
-   * Run the complete hardware inspection before
-   * attempting to initialize any model.
-   */
-  const h = await inspect();
+  const m = model();
+  let h = null;
 
-  showHW(h);
+  if (!isOnlineModel(m)) {
+    /*
+     * Run the complete hardware inspection before
+     * attempting to initialize a local model.
+     */
+    h = await inspect();
+    hardwareBox.hidden = false;
+    showHW(h);
+  } else {
+    hardwareBox.hidden = true;
+  }
 
   try {
-    if (!h.secureContext) {
+    if (h && !h.secureContext) {
       throw Error(
         "WebGPU requires HTTPS."
       );
     }
 
-    if (!h.webgpu) {
+    if (h && !h.webgpu) {
       throw Error(
         h.error ||
           "WebGPU is not available."
       );
     }
 
-    if (!h.adapter) {
+    if (h && !h.adapter) {
       throw Error(
         h.error ||
           "WebGPU adapter unavailable. " +
@@ -415,31 +454,35 @@ async function loadModel() {
       );
     }
 
-    if (!h.device) {
+    if (h && !h.device) {
       throw Error(
         h.error ||
           "WebGPU adapter was found, but the GPU device could not be created."
       );
     }
 
-    const m = model();
+    progressText.textContent =
+      isOnlineModel(m)
+        ? "Connecting to your secure Online Assist proxy..."
+        : `GPU available · loading ${m.name}...`;
 
-    progressText.textContent =
-      `GPU available · loading ${m.name}...`;
-
-    if (m.runtime === "bitgpu") {
+    if (m.runtime === "online") {
+      await loadOnlineAssist();
+    } else if (m.runtime === "bitgpu") {
       await loadBonsaiBitGPU(m);
     } else {
       await loadWebLLM(m);
     }
 
-    status.textContent =
-      `Local AI · ${m.name} · WebGPU`;
+    status.textContent = isOnlineModel(m)
+      ? "Online Assist · ready"
+      : `Local AI · ${m.name} · WebGPU`;
 
     progress.style.width = "100%";
 
-    progressText.textContent =
-      "Ready · model is running on this device.";
+    progressText.textContent = isOnlineModel(m)
+      ? "Ready · messages will use your configured online service."
+      : "Ready · model is running on this device.";
 
     setTimeout(() => {
       progressWrap.hidden = true;
@@ -460,7 +503,9 @@ async function loadModel() {
 
     errorBox.textContent =
       `${
-        m.runtime === "bitgpu"
+        m.runtime === "online"
+          ? "ONLINE ASSIST"
+          : m.runtime === "bitgpu"
           ? "BITGPU"
           : "WEBLLM / MLC"
       } INITIALIZATION ERROR\n\n` +
@@ -506,7 +551,13 @@ async function loadWebLLM(m) {
           "Preparing local GPU runtime...";
       },
     }
-  );
+  );
+}
+
+async function loadOnlineAssist() {
+  engineRuntime = "online";
+  engine = { remote: true };
+  progress.style.width = "100%";
 }
 
 async function loadBonsaiBitGPU(m) {
@@ -603,7 +654,9 @@ async function sendMessage(e) {
   try {
     const m = model();
 
-    if (engineRuntime === "bitgpu") {
+    if (engineRuntime === "online") {
+      await sendOnlineAssistMessage(c, a);
+    } else if (engineRuntime === "bitgpu") {
       await sendBonsaiMessage(
         c,
         a
@@ -656,7 +709,9 @@ async function sendMessage(e) {
 
     errorBox.textContent =
       `${
-        engineRuntime === "bitgpu"
+        engineRuntime === "online"
+          ? "ONLINE ASSIST"
+          : engineRuntime === "bitgpu"
           ? "BITGPU"
           : "WEBLLM / MLC"
       } GENERATION ERROR\n\n` +
@@ -669,8 +724,9 @@ async function sendMessage(e) {
 
     errorBox.hidden = false;
 
-    status.textContent =
-      `Local AI · ${model().name} · generation failed`;
+    status.textContent = isOnlineModel()
+      ? "Online Assist · request failed"
+      : `Local AI · ${model().name} · generation failed`;
 
     progressWrap.hidden = false;
 
@@ -743,20 +799,24 @@ async function sendWebLLMMessage(
 }
 
 async function sendBonsaiMessage(
-  c,
-  bubble
+  c,
+  bubble
 ) {
-  let out = "";
+  let out = "";
 
-  const messages =
-    c.messages.slice(-14);
+  const generation = model().generation || {
+    temperature: 0.7,
+    topP: 0.9,
+  };
+
+  const messages =
+    c.messages.slice(-14);
 
   await chatEngine.send(
-    messages,
-    {
-      maxTokens: 256,
-      temperature: 0.7,
-      topP: 0.9,
+    messages,
+    {
+      maxTokens: 256,
+      ...generation,
 
       onText: (text) => {
         out += text;
@@ -774,7 +834,35 @@ async function sendBonsaiMessage(
     content: out.trim(),
   });
 
-  save();
+  save();
+}
+
+async function sendOnlineAssistMessage(c, bubble) {
+  bubble.textContent = "Thinking online…";
+
+  const response = await fetch("/api/online-assist", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages: c.messages.slice(-16) }),
+  });
+
+  const payload = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw Error(payload?.error || `Online Assist returned ${response.status}.`);
+  }
+
+  const out = payload?.content?.trim();
+
+  if (!out) {
+    throw Error("Online Assist returned an empty response.");
+  }
+
+  bubble.textContent = out;
+  chat.scrollTop = chat.scrollHeight;
+
+  c.messages.push({ role: "assistant", content: out });
+  save();
 }
 
 function formatError(e) {
@@ -855,8 +943,9 @@ $("#composer").onsubmit =
   sendMessage;
 
 modelButton.textContent =
-  model().name;
+  model().name;
 
+updateWelcome();
 renderModels();
 render();
 

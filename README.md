@@ -1,5 +1,11 @@
 # Pocket AI — v0.4.2
 
+## v0.4.3 — Online Assist
+
+- Corrected the Bonsai 27B GGUF download URL.
+- Added a clearly labeled remote Online Assist mode.
+- Added a Firebase Function proxy so the PWA never contains the remote API key.
+
 ## Current model lineup
 
 - **Qwen 0.5B** — MLC/WebLLM known-good baseline.
@@ -11,6 +17,27 @@ Qwen3 1.7B is intentionally omitted from this build while we continue testing th
 ## Current build
 
 Pocket AI is a browser-local PWA that runs models directly on the device GPU. It does not require a server or API key.
+
+It also includes an optional **Online Assist** mode. Local models remain private and
+offline; Online Assist sends the active conversation to the FreeLLM-compatible service
+that you configure through a Firebase Function.
+
+## Online Assist setup
+
+Online Assist deliberately keeps credentials out of the browser. Before deploying,
+set the complete OpenAI-compatible chat-completions URL and your API key as Firebase
+secrets:
+
+```bash
+firebase functions:secrets:set FREELLM_API_URL
+firebase functions:secrets:set FREELLM_API_KEY
+firebase deploy --only functions,hosting
+```
+
+For a self-hosted FreeLLMAPI instance, the URL is normally
+`https://your-host.example/v1/chat/completions`. The proxy uses its `auto:smart`
+route by default. Online Assist is remote by design: do not use it for messages you
+want to keep entirely on-device.
 
 ### v0.4.2 — Bonsai 4B experiment
 - Kept **Qwen 0.5B** as the known-good WebLLM baseline.
