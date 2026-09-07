@@ -28,6 +28,7 @@
     "fsevents@2.3.3": true,
     "re2@1.26.1": true,
     "@firebase/util@1.15.3": true,
-    "protobufjs@7.6.6": true
+    "protobufjs@6.11.6": true,
+    "protobufjs@6.11.3": true
   }
 }
