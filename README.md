@@ -1,4 +1,11 @@
-# Pocket AI — v0.4.2
+# Pocket AI — v0.4.4
+
+## v0.4.4 — Finished answers
+
+- Raised local answer-length limits (WebLLM 96 → 512 tokens, Bonsai 256 → 512) so longer replies can complete.
+- When a reply still hits the length cap, a **Continue** chip appears under the bubble; tapping it resumes exactly where the answer stopped, in the same bubble (up to two chained continuations).
+- Conversation history is now trimmed by token estimate against the 2048-token context window instead of a fixed message count, so long chats degrade gracefully instead of silently overflowing.
+- Online Assist is unchanged (still capped server-side at 512 tokens).
 
 ## v0.4.3 — Online Assist
 
