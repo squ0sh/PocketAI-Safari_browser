@@ -1,4 +1,11 @@
-# Pocket AI — v0.4.5
+# Pocket AI — v0.5.0
+
+## v0.5.0 — Honest load bar, and an iPhone makes eyes at a 27B
+
+- **The Bonsai load bar works now.** bitgpu reports phase + bytes (`loaded`/`total`), but the app was watching for a `fraction` field that never existed — the bar sat dead through every download. The bar now shows a live MB counter, percentage, and per-phase labels (manifest → weights → pipeline compilation).
+- **Preflight for heavyweight models** (currently the 27B): asks the browser for persistent storage, reports free space, and warns before committing to a ~3.8 GB stream. It warns, it never blocks — the experiment is yours.
+- **Bonsai 27B Q1 enabled as a desktop-class experiment on iPhone.** The architecture (qwen3_5 hybrid, `head_dim` 256) is within bitgpu 0.19.1's supported envelope; the risk is purely physics — if a phone refuses, it now says so somewhere informative.
+- **Honest cache note:** WebLLM weights persist in IndexedDB; Bonsai weights currently re-stream from the network on every launch. An app-owned on-disk cache is planned once the 27B proves it boots.
 
 ## v0.4.5 — Stop button, a history drawer that actually draws, downloadable threads
 
@@ -83,7 +90,7 @@ Open the HTTPS Vite address on the iPhone.
 
 ## Important
 
-The first time a model is used, its weights are downloaded and cached by the browser. The application itself does not need a model server.
+The first time a WebLLM model (Qwen) is used, its weights are downloaded and cached in IndexedDB, so later launches are local. Bonsai models currently re-stream their weights over the network on every launch (an app-owned disk cache is on the roadmap). The application itself does not need a model server.
 
 Switching models after one is loaded reloads the PWA so the WebGPU runtime is cleanly recreated.
 

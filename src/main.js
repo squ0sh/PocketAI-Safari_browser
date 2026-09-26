@@ -69,9 +69,10 @@ const MODELS = [
   },
   {
     id: "Bonsai-27B-bitgpu",
-    name: "Bonsai 27B Q1",
+    name: "Bonsai 27B Q1",
     tier: "1-bit · EXTREME",
-    description: "27B parameter hybrid model · ~3.8 GB · bitgpu WebGPU.",
+    description:
+      "27B hybrid · streams ~3.8 GB into memory every launch · phones may refuse; desktop-class experiment.",
     runtime: "bitgpu",
     manifestUrl:
       "https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.19.1/models/bonsai-27b-gguf/manifest.json",
@@ -85,6 +86,7 @@ const MODELS = [
       "https://huggingface.co/prism-ml/Bonsai-27B-unpacked/resolve/main/tokenizer_config.json",
     maxSeqLen: 2048,
     kvCache: "q8",
+    approxBytes: 3803452480,
     generation: { temperature: 0.5, topP: 0.85, topK: 20 },
   },
   {
@@ -371,6 +373,34 @@ function stopGeneration() {
   }
 }
 
+// Human-readable megabytes for the download counter.
+function fmtMB(bytes) {
+  return `${Math.floor((bytes || 0) / 1048576)} MB`;
+}
+
+// Preflight for heavyweight models that stream into memory with no persistent
+// cache: ask for persistent storage, warn if the device looks tight, never block.
+async function storagePreflight(m) {
+  if (!m.approxBytes) return;
+  const needMB = Math.ceil(m.approxBytes / 1048576);
+  try {
+    await navigator.storage?.persist?.();
+  } catch {}
+  let est = null;
+  try {
+    est = await navigator.storage?.estimate?.();
+  } catch {}
+  const freeMB =
+    est?.quota != null ? Math.floor((est.quota - (est.usage || 0)) / 1048576) : null;
+  progressText.textContent =
+    freeMB == null
+      ? `${m.name} streams ~${needMB} MB into memory (no disk cache yet). WiFi recommended. Loading...`
+      : freeMB < needMB + 512
+        ? `${m.name} needs ~${needMB} MB; this device reports about ${freeMB} MB free. It may refuse — trying anyway...`
+        : `${m.name} streams ~${needMB} MB (~${freeMB} MB free here). WiFi recommended. Loading...`;
+  // Long enough to actually read it before the download counter takes over.
+  await new Promise((r) => setTimeout(r, 2600));
+}
 // Technical wall → one sentence a human can act on.
 function friendlyGenerationError(e) {
   const s = String(e?.message || e || "");
@@ -594,6 +624,10 @@ async function loadModel() {
         ? "Connecting to your secure Online Assist proxy..."
         : `GPU available · loading ${m.name}...`;
 
+    if (m.runtime === "bitgpu") {
+      await storagePreflight(m);
+    }
+
     if (m.runtime === "online") {
       await loadOnlineAssist();
     } else if (m.runtime === "bitgpu") {
@@ -709,23 +743,38 @@ async function loadBonsaiBitGPU(m) {
     kvCache: m.kvCache,
     maxSeqLen: m.maxSeqLen,
 
+    // bitgpu reports { phase, loaded, total } — translate into an honest bar.
+    // (Previously this read a nonexistent p.fraction, so the bar sat at 0%
+    // through every Bonsai download.)
     onProgress: (p) => {
-      if (p?.fraction != null) {
-        progress.style.width =
-          `${Math.min(
-            100,
-            Math.max(
-              0,
-              p.fraction * 100
-            )
-          )}%`;
-      }
+      if (!p) return;
 
-      progressText.textContent =
-        p?.text ||
-        `Loading ${m.name} · ${
-          p?.phase || "preparing"
-        }...`;
+      let f = null;
+      let text = null;
+
+      if (p.phase === "manifest") {
+        f = 0.02;
+        text = `Reading model manifest · ${m.name}...`;
+      } else if (p.phase === "weights") {
+        if (p.total > 0 && p.loaded != null) {
+          const pct = Math.min(100, Math.floor((100 * p.loaded) / p.total));
+          f = 0.02 + 0.96 * (p.loaded / p.total);
+          text = `Downloading & processing weights · ${fmtMB(p.loaded)} / ${fmtMB(p.total)} (${pct}%)`;
+        } else {
+          text = `Loading ${m.name} weights...`;
+        }
+      } else if (p.phase === "pipelines") {
+        f = 0.98;
+        text = "Compiling GPU pipelines...";
+      }
+
+      if (f != null) {
+        progress.style.width = `${Math.min(100, Math.max(0, f * 100))}%`;
+      }
+
+      if (text) {
+        progressText.textContent = text;
+      }
     },
   });
 
