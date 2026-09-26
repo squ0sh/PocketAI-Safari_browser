@@ -1,4 +1,12 @@
-# Pocket AI — v0.4.4
+# Pocket AI — v0.4.5
+
+## v0.4.5 — Stop button, a history drawer that actually draws, downloadable threads
+
+- **Stop mid-answer.** The send button becomes ⏹ during generation (WebLLM `interruptGenerate()`, AbortSignal for bitgpu); a stopped answer keeps whatever text it had and never offers to Continue. Status line shows "…generating".
+- **The history drawer finally exists.** It was wired in markup and CSS but never rendered — chats *were* saving; nothing listed them. Rows now open the chat, **↓ downloads a Markdown transcript** (straight to Files on iOS), **× deletes**.
+- **Chats are ephemeral by default.** History now lives in sessionStorage: it survives the required reload on model switch, and vanishes when the tab closes. Download anything you want to keep. Existing conversations migrate across once, then the durable copy is removed.
+- Friendlier context-overflow failure ("chat too long for the model's memory — start a new chat") instead of a raw engine traceback.
+- Service-worker cache key bumped to v0.4.5.
 
 ## v0.4.4 — Finished answers
 
