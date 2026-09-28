@@ -1,4 +1,11 @@
-# Pocket AI — v0.5.0
+# Pocket AI — v0.5.1
+
+## v0.5.1 — Housekeeping: one check command, one service worker, a leaner repo
+
+- **`npm run check`** is now the single local gate: syntax-checks `src/main.js` + `functions/index.js`, runs the production Vite build, then boots the fresh `dist/` headless over CDP and asserts the model tiles and the history drawer actually render with zero boot errors. It auto-skips the browser step when no Chromium is on PATH.
+- **One service worker** lives in `public/sw.js` (copied into `dist/` at build). The old root-level copy is gone.
+- **`dist/` and `.vite/` are no longer tracked.** Builds are ephemeral: `npm run build` regenerates them, and the Firebase GitHub Actions redeploy chain builds fresh in CI. To deploy by hand: `npm run build && firebase deploy`.
+- Repository slimmed from 200+ tracked files to a handful: the vendored `.agents/` / `.claude/` skills (Flutter-era docs for this JS app) are out of git.
 
 ## v0.5.0 — Honest load bar, and an iPhone makes eyes at a 27B
 
@@ -78,6 +85,7 @@ The bitgpu project documents ready-made manifests for Bonsai 1.7B, 4B, and 8B, w
 | Qwen 0.5B | MLC/WebLLM | Known-good baseline | small |
 | Bonsai 1.7B Q1 | bitgpu/WebGPU | Confirmed working | ~240–290 MB class |
 | Bonsai 4B Q1 | bitgpu/WebGPU | Experimental | ~570 MB class |
+| Bonsai 27B Q1 | bitgpu/WebGPU | Desktop-class experiment (iPhone first) | streamed ~3.8 GB, not persisted |
 
 ## Run
 
@@ -87,6 +95,9 @@ npm run dev
 ```
 
 Open the HTTPS Vite address on the iPhone.
+
+Before shipping, run `npm run check` (syntax + production build + a headless
+boot probe when Chromium is installed). CI runs it on every push.
 
 ## Important
 

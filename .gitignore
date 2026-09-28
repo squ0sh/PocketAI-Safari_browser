@@ -10,6 +10,12 @@ firebase-debug.*.log*
 # Firebase cache
 .firebase/
 
+# Build output (deployable: build, then `firebase deploy` — never committed)
+dist/
+
+# Vite dev cache
+.vite/
+
 # Firebase config
 
 # Uncomment this if you'd like others to create their own Firebase project.
