@@ -723,6 +723,11 @@ async function loadOnlineAssist() {
 }
 
 const MODEL_CACHE = "pocket-ai-models-v1";
+// iOS Safari crashes its tab process when page-side cache.put() materializes a
+// body much beyond ~1.5GB (Jetsam), and its Cache API quota is ~1GB — 4B/8B/27B
+// blow straight through it. Cap the store to what 1.7B needs; bigger models
+// stream from the network every launch instead (the pre-v0.6.0 behavior).
+const MODEL_CACHE_MAX_BYTES = 384 * 1024 * 1024;
 
 // Serve the weights GGUF from a persistent Cache API store when available.
 // First launch: bitgpu streams the live response while the same stream is
@@ -737,9 +742,10 @@ async function cachedModelStream(url) {
     if (cache) {
       const cached = await cache.match(url);
       if (cached && cached.ok && cached.body) {
-        return cached.body;
-      }
-      if (cached) {
+        const length = Number(cached.headers.get("content-length") || 0);
+        if (length > 0 && length <= MODEL_CACHE_MAX_BYTES) {
+          return cached.body;
+        }
         cache.delete(url).catch(() => {});
       }
     }
@@ -753,7 +759,12 @@ async function cachedModelStream(url) {
   }
 
   if (cache) {
-    cache.put(url, response.clone()).catch(() => {});
+    const length = Number(response.headers.get("content-length") || 0);
+    if (length > 0 && length <= MODEL_CACHE_MAX_BYTES) {
+      cache.put(url, response.clone()).catch(() => {});
+    } else {
+      cache.delete(url).catch(() => {});
+    }
   }
 
   return response.body;

@@ -2,7 +2,7 @@
 
 ## v0.6.0 — Bonsai weights on disk, and a PWA iPhones finally recognize
 
-- **Bonsai weights are cached on device.** bitgpu already streamed the GGUF, so the real cost was re-downloading it every launch. The app now hands bitgpu a Cache API-backed `fetchStream`: the first launch downloads once (streaming to disk as it loads), later launches stream from disk — instant and offline-capable. Best-effort by design: if storage refuses (the 27B's ~3.8 GB can exceed iOS's cache quota), it silently falls back to plain network streaming. A one-shot `navigator.storage.persist()` reduces eviction odds.
+- **Bonsai weights are cached on device — up to about 384 MB.** bitgpu already streamed the GGUF, so the real cost was re-downloading it every launch. The app now hands bitgpu a Cache API-backed `fetchStream`: the first launch downloads once (streaming to disk as it loads), later launches stream from disk — instant and offline-capable. iOS Safari crashes its page process when writing bodies much beyond ~1.5 GB and its Cache API quota is ~1 GB, so the store is size-capped: 1.7B (~290 MB) caches; 4B/8B/27B silently fall back to plain network streaming every launch rather than draining the phone's memory. A one-shot `navigator.storage.persist()` reduces eviction odds.
 - **The service worker plays nice with the cache.** It now ignores cross-origin fetches (model weights never churn the shell cache) and never deletes `pocket-ai-models-*` on activation, so shell updates can't wipe a multi-GB model.
 - **The PWA manifest and icon actually reach iPhones now.** They lived at the repo root instead of `public/`, so the build never shipped them — the live site was answering `/manifest.webmanifest` and `/icon.svg` with `index.html` via the SPA rewrite. iOS was being handed an HTML page as its manifest and as its home-screen icon. They now live in `public/`, joined by `icon-180.png`, `icon-192.png`, and `icon-512.png` (rasterized from the SVG).
 - **iOS PWA polish:** `apple-touch-icon` points at a real PNG (iOS ignores SVG icons), plus `apple-mobile-web-app-capable`, `mobile-web-app-capable`, and a `black-translucent` status bar.
@@ -93,7 +93,7 @@ The bitgpu project documents ready-made manifests for Bonsai 1.7B, 4B, and 8B, w
 | Qwen 0.5B | MLC/WebLLM | Known-good baseline | small |
 | Bonsai 1.7B Q1 | bitgpu/WebGPU | Confirmed working | ~240–290 MB class |
 | Bonsai 4B Q1 | bitgpu/WebGPU | Experimental | ~570 MB class |
-| Bonsai 27B Q1 | bitgpu/WebGPU | Desktop-class experiment (iPhone first) | streamed ~3.8 GB · cached when storage allows |
+| Bonsai 27B Q1 | bitgpu/WebGPU | Desktop-class experiment (iPhone first) | streamed ~3.8 GB every launch |
 
 ## Run
 
