@@ -39,7 +39,7 @@ function freePort() {
 
 const MIME = {
   ".html": "text/html", ".js": "text/javascript",
-  ".css": "text/css", ".svg": "image/svg+xml",
+  ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png",
   ".json": "application/json", ".webmanifest": "application/manifest+json",
 };
 
@@ -71,6 +71,42 @@ for (const file of ["src/main.js", "functions/index.js"]) run("node", ["--check"
 
 // 2. Production build.
 run("npx", ["vite", "build"]);
+
+// 2b. PWA wiring: the manifest and icons must exist in dist and serve as real
+//     content, not fall through to the SPA index.html rewrite — that is exactly
+//     what shipped before v0.6.0, when /manifest.webmanifest and /icon.svg
+//     answered with text/html on the live site (broken manifest + home-screen
+//     icon on iOS).
+const pwaPort = await freePort();
+const pwaServer = await serve(join(root, "dist"), pwaPort).catch(() => null);
+if (!pwaServer) {
+  failures.push("pwa check: probe server could not start");
+} else {
+  const get = (p) => fetch(`http://127.0.0.1:${pwaPort}${p}`);
+  const manifestBody = await get("/manifest.webmanifest").then((r) => r.text());
+  let iconNames = [];
+  let manifestOk = false;
+  try {
+    const parsed = JSON.parse(manifestBody);
+    iconNames = (parsed.icons || []).map((i) => i.src);
+    manifestOk = Array.isArray(parsed.icons) && parsed.icons.some((i) => i.type === "image/png");
+  } catch {}
+  if (!manifestOk) {
+    failures.push(`pwa check: /manifest.webmanifest is not a JSON manifest with PNG icons — first bytes: ${manifestBody.slice(0, 80)}`);
+  } else {
+    for (const icon of ["/icon.svg", "/icon-180.png", "/icon-192.png", "/icon-512.png"]) {
+      const buf = Buffer.from(await get(icon).then((r) => r.arrayBuffer()));
+      const isPng = buf.length > 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+      const isSvg = buf.length > 5 && buf.subarray(0, 4).toString() === "<svg";
+      const looksHtml = buf.length > 15 && buf.subarray(0, 15).toString().toLowerCase().startsWith("<!doctype html");
+      if (looksHtml || (icon.endsWith(".png") && !isPng) || (icon.endsWith(".svg") && !isSvg)) {
+        failures.push(`pwa check: ${icon} served the wrong bytes (html=${looksHtml} png=${isPng} svg=${isSvg}, ${buf.length} bytes)`);
+      }
+    }
+    console.log(`  pwa: manifest OK (${iconNames.join(", ")}) + 4 icon files serve real content`);
+  }
+  pwaServer.close();
+}
 
 // 3. Headless boot probe over the freshly built dist/. Best-effort: skipped
 //    when no Chromium is on PATH. Drives a real tab over CDP (the ui-probes

@@ -722,8 +722,45 @@ async function loadOnlineAssist() {
   progress.style.width = "100%";
 }
 
+const MODEL_CACHE = "pocket-ai-models-v1";
+
+// Serve the weights GGUF from a persistent Cache API store when available.
+// First launch: bitgpu streams the live response while the same stream is
+// stored in the background. Later launches stream straight from disk (instant,
+// works offline). The service worker ignores cross-origin fetches and never
+// deletes pocket-ai-models-*, so shell updates can't evict a multi-GB model.
+async function cachedModelStream(url) {
+  let cache = null;
+
+  try {
+    cache = await caches.open(MODEL_CACHE);
+    if (cache) {
+      const cached = await cache.match(url);
+      if (cached && cached.ok && cached.body) {
+        return cached.body;
+      }
+      if (cached) {
+        cache.delete(url).catch(() => {});
+      }
+    }
+  } catch {
+    cache = null;
+  }
+
+  const response = await fetch(url);
+  if (!response.ok || !response.body) {
+    throw new Error(`Could not fetch model data: HTTP ${response.status}`);
+  }
+
+  if (cache) {
+    cache.put(url, response.clone()).catch(() => {});
+  }
+
+  return response.body;
+}
+
 async function loadBonsaiBitGPU(m) {
-  engineRuntime = "bitgpu";
+  engineRuntime = "bitgpu";
 
   progressText.textContent =
     `Starting browser-native 1-bit runtime · ${m.name}...`;
@@ -739,9 +776,10 @@ async function loadBonsaiBitGPU(m) {
   engine = await createBitGPUEngine({
     manifestUrl: m.manifestUrl,
     auxUrl: m.auxUrl,
-    dataUrl: m.dataUrl,
-    kvCache: m.kvCache,
-    maxSeqLen: m.maxSeqLen,
+dataUrl: m.dataUrl,
+    fetchStream: cachedModelStream,
+    kvCache: m.kvCache,
+    maxSeqLen: m.maxSeqLen,
 
     // bitgpu reports { phase, loaded, total } — translate into an honest bar.
     // (Previously this read a nonexistent p.fraction, so the bar sat at 0%
@@ -1188,7 +1226,13 @@ render();
 renderHistory();
 
 if ("serviceWorker" in navigator) {
-  navigator.serviceWorker
-    .register("/sw.js")
-    .catch(console.warn);
+  navigator.serviceWorker
+    .register("/sw.js")
+    .catch(console.warn);
+}
+
+// Reduce the odds of the browser evicting the model weight cache under
+// storage pressure. Best-effort; iOS grants this without a user prompt.
+if (navigator.storage?.persist) {
+  navigator.storage.persist().catch(() => {});
 }
