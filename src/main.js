@@ -116,6 +116,7 @@ const chatStore = {
 };
 
 let selected = localStorage.getItem(KEY) || MODELS[0].id;
+let pickedFile = null;   // GGUF picked via "Load from a file…"; consumed on load
 let engine = null;
 let chatEngine = null;
 let engineRuntime = null;
@@ -153,6 +154,45 @@ function model() {
 
 function isOnlineModel(m = model()) {
   return m.runtime === "online";
+}
+
+function normName(s) {
+  return s.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+window.pickModelFile = function () {
+  fileInput.value = "";
+  fileInput.click();
+};
+
+async function readGgufFromFile(file) {
+  const { fromGgufBytes } = await import("bitgpu/gguf");
+  let size = 1024 * 1024;
+  let lastErr = null;
+  while (size <= 64 * 1024 * 1024) {
+    const header = await file.slice(0, size).arrayBuffer();
+    try {
+      return fromGgufBytes(header, file.name);
+    } catch (e) {
+      lastErr = e;
+      size *= 2;
+    }
+  }
+  throw new Error(
+    "Couldn't read the GGUF header from that file. " +
+      (lastErr && lastErr.message ? lastErr.message : lastErr)
+  );
+}
+
+function matchModelByFile(name) {
+  const n = normName(name);
+  for (const m of MODELS) {
+    if (m.runtime !== "bitgpu") continue;
+    const base = normName(m.dataUrl.split("/").pop().replace(/\.gguf$/i, ""));
+    if (base && n.includes(base)) return m;
+  }
+  const bySlug = MODELS.find((m) => m.runtime === "bitgpu" && n.includes(normName(m.name)));
+  return bySlug || MODELS.find((m) => m.runtime === "bitgpu");
 }
 
 function updateWelcome() {
@@ -210,8 +250,33 @@ function renderModels() {
       }
     };
 
-    modelList.append(b);
-  }
+modelList.append(b);
+  }
+
+  addFileControls();
+}
+
+function addFileControls() {
+  const fileRow = document.createElement("div");
+  fileRow.className = "model-file-row";
+
+  const fileButton = document.createElement("button");
+  fileButton.className = "model-file-load";
+  fileButton.type = "button";
+  fileButton.textContent = "Load from a file…";
+  fileButton.onclick = window.pickModelFile;
+
+  const dl = document.createElement("a");
+  dl.className = "model-download";
+  const big = MODELS.find((m) => m.id === "Bonsai-27B-bitgpu");
+  dl.href = big ? big.dataUrl : "#";
+  dl.download = "";
+  dl.target = "_blank";
+  dl.rel = "noopener";
+  dl.textContent = "or save the 27B weights to Files first";
+
+  fileRow.append(fileButton, dl);
+  modelList.append(fileRow);
 }
 
 function addBubble(role, text) {
@@ -625,7 +690,12 @@ async function loadModel() {
         : `GPU available · loading ${m.name}...`;
 
     if (m.runtime === "bitgpu") {
-      await storagePreflight(m);
+      if (pickedFile) {
+        progressText.textContent =
+          `Loading weights from a local file (no download) · ${m.name}...`;
+      } else {
+        await storagePreflight(m);
+      }
     }
 
     if (m.runtime === "online") {
@@ -773,70 +843,111 @@ async function cachedModelStream(url) {
 async function loadBonsaiBitGPU(m) {
   engineRuntime = "bitgpu";
 
-  progressText.textContent =
-    `Starting browser-native 1-bit runtime · ${m.name}...`;
+  progressText.textContent =
+    `Starting browser-native 1-bit runtime · ${m.name}...`;
 
-  const {
-    createEngine: createBitGPUEngine,
-  } = await import("bitgpu");
+  const ggufFile = pickedFile;
+  pickedFile = null;
 
-  const {
-    createChat: createBitGPUChat,
-  } = await import("bitgpu/chat");
+  let gguf = null;
 
-  engine = await createBitGPUEngine({
-    manifestUrl: m.manifestUrl,
-    auxUrl: m.auxUrl,
-dataUrl: m.dataUrl,
-    fetchStream: cachedModelStream,
-    kvCache: m.kvCache,
-    maxSeqLen: m.maxSeqLen,
+  if (ggufFile) {
+    progressText.textContent = `Reading ${ggufFile.name} header...`;
+    gguf = await readGgufFromFile(ggufFile);
+    progressText.textContent =
+      `Loading weights from local file · ${ggufFile.name}...`;
+  }
 
-    // bitgpu reports { phase, loaded, total } — translate into an honest bar.
-    // (Previously this read a nonexistent p.fraction, so the bar sat at 0%
-    // through every Bonsai download.)
-    onProgress: (p) => {
-      if (!p) return;
+  const {
+    createEngine: createBitGPUEngine,
+    GpuOutOfMemoryError,
+    WebGPUUnavailableError,
+  } = await import("bitgpu");
 
-      let f = null;
-      let text = null;
+  const {
+    createChat: createBitGPUChat,
+  } = await import("bitgpu/chat");
 
-      if (p.phase === "manifest") {
-        f = 0.02;
-        text = `Reading model manifest · ${m.name}...`;
-      } else if (p.phase === "weights") {
-        if (p.total > 0 && p.loaded != null) {
-          const pct = Math.min(100, Math.floor((100 * p.loaded) / p.total));
-          f = 0.02 + 0.96 * (p.loaded / p.total);
-          text = `Downloading & processing weights · ${fmtMB(p.loaded)} / ${fmtMB(p.total)} (${pct}%)`;
-        } else {
-          text = `Loading ${m.name} weights...`;
+  try {
+    engine = await createBitGPUEngine({
+      ...(gguf
+        ? {
+            manifest: gguf.manifest,
+            aux: gguf.aux,
+            dataUrl: "file://" + ggufFile.name,
+            fetchStream: () => ggufFile.stream(),
+          }
+        : {
+            manifestUrl: m.manifestUrl,
+            auxUrl: m.auxUrl,
+            dataUrl: m.dataUrl,
+            fetchStream: cachedModelStream,
+          }),
+      kvCache: m.kvCache,
+      maxSeqLen: m.maxSeqLen,
+
+      // bitgpu reports { phase, loaded, total } — translate into an honest bar.
+      // (Previously this read a nonexistent p.fraction, so the bar sat at 0%
+      // through every Bonsai download.)
+      onProgress: (p) => {
+        if (!p) return;
+
+        let f = null;
+        let text = null;
+
+        if (p.phase === "manifest") {
+          f = 0.02;
+          text = gguf
+            ? `Model header parsed · ${m.name}...`
+            : `Reading model manifest · ${m.name}...`;
+        } else if (p.phase === "weights") {
+          if (gguf) {
+            f = 0.02 + 0.96 * Math.min(1, (p.loaded || 0) / (2 * 1024 * 1024));
+            text = `Loading weights from file · ${ggufFile.name}`;
+          } else if (p.total > 0 && p.loaded != null) {
+            const pct = Math.min(100, Math.floor((100 * p.loaded) / p.total));
+            f = 0.02 + 0.96 * (p.loaded / p.total);
+            text = `Downloading & processing weights · ${fmtMB(p.loaded)} / ${fmtMB(p.total)} (${pct}%)`;
+          } else {
+            text = `Loading ${m.name} weights...`;
+          }
+        } else if (p.phase === "pipelines") {
+          f = 0.98;
+          text = "Compiling GPU pipelines...";
         }
-      } else if (p.phase === "pipelines") {
-        f = 0.98;
-        text = "Compiling GPU pipelines...";
-      }
 
-      if (f != null) {
-        progress.style.width = `${Math.min(100, Math.max(0, f * 100))}%`;
-      }
+        if (f != null) {
+          progress.style.width = `${Math.min(100, Math.max(0, f * 100))}%`;
+        }
 
-      if (text) {
-        progressText.textContent = text;
-      }
-    },
-  });
+        if (text) {
+          progressText.textContent = text;
+        }
+      },
+    });
+  } catch (e) {
+    if (e instanceof GpuOutOfMemoryError) {
+      throw new Error(
+        `This device ran out of GPU memory while loading ${m.name} (needs roughly ${fmtMB(m.approxBytes || 0)} of device memory). ` +
+          `Close other tabs and apps and try again — on a tight iPhone this is often the limit.`
+      );
+    }
+    if (e instanceof WebGPUUnavailableError) {
+      throw new Error(`WebGPU is not available on this device. ${e.message}`);
+    }
+    throw e;
+  }
 
-  chatEngine = await createBitGPUChat(
-    engine,
-    {
-      tokenizerJsonUrl:
-        m.tokenizerJsonUrl,
+  chatEngine = await createBitGPUChat(
+    engine,
+    {
+      tokenizerJsonUrl:
+        m.tokenizerJsonUrl,
 
-      tokenizerConfigUrl:
-        m.tokenizerConfigUrl,
-    }
-  );
+      tokenizerConfigUrl:
+        m.tokenizerConfigUrl,
+    }
+  );
 }
 
 async function sendMessage(e) {
@@ -1216,6 +1327,45 @@ $("#newChatButton").onclick = () => {
 
   drawer.classList.remove("open");
 };
+
+function onFilePicked(file) {
+  const m = matchModelByFile(file.name);
+  if (!m) {
+    errorBox.textContent =
+      "That file doesn't look like a Bonsai GGUF. Pick a Bonsai-*.gguf.";
+    errorBox.hidden = false;
+    return;
+  }
+
+  pickedFile = file;
+  selected = m.id;
+  localStorage.setItem(KEY, selected);
+  modelButton.textContent = m.name;
+  sheet.classList.remove("open");
+  updateWelcome();
+
+  // In-session switch: dispose the previous engine instead of the usual
+  // location.reload(), because reload would drop the File handle.
+  if (engine) {
+    try { engine.dispose?.(); } catch {}
+    try { chatEngine?.dispose?.(); } catch {}
+    engine = null;
+    chatEngine = null;
+    engineRuntime = null;
+  }
+
+  load.disabled = false;
+  loadModel();
+}
+
+const fileInput = document.createElement("input");
+fileInput.type = "file";
+fileInput.accept = ".gguf";
+fileInput.style.display = "none";
+fileInput.addEventListener("change", () => {
+  if (fileInput.files && fileInput.files[0]) onFilePicked(fileInput.files[0]);
+});
+document.body.append(fileInput);
 
 load.onclick = loadModel;
 

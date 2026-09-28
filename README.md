@@ -7,6 +7,7 @@
 - **The PWA manifest and icon actually reach iPhones now.** They lived at the repo root instead of `public/`, so the build never shipped them — the live site was answering `/manifest.webmanifest` and `/icon.svg` with `index.html` via the SPA rewrite. iOS was being handed an HTML page as its manifest and as its home-screen icon. They now live in `public/`, joined by `icon-180.png`, `icon-192.png`, and `icon-512.png` (rasterized from the SVG).
 - **iOS PWA polish:** `apple-touch-icon` points at a real PNG (iOS ignores SVG icons), plus `apple-mobile-web-app-capable`, `mobile-web-app-capable`, and a `black-translucent` status bar.
 - **`npm run check` now guards the PWA wiring**: it asserts `/manifest.webmanifest` parses as JSON with PNG icons, and that the icon files serve as images, not HTML.
+- **The 27B finally has a reliable road onto an iPhone: load its weights from a local file.** The model sheet's "Load from a file…" opens Safari's file picker; pick a saved `Bonsai-*.gguf` (save the 27B via the "save the 27B weights to Files" shortcut, which hands Safari a resumable background download) and the app parses the GGUF header in place with `fromGgufBytes` and streams weights straight from the file — no 3.8 GB re-download, no Cache-quota or Jetsam risk from the store, and the download lives in Files where iOS storage rules are kind. 1.7B/4B/8B get the same path, so those never need re-downloading either. Because a picked file can't survive a page reload, an in-session model switch disposes the old engine instead of reloading. Honest caveat: the ~3.8 GB GPU footprint itself is unchanged, so a tight iPhone can still run out of memory — but it now fails with a clear "ran out of GPU memory" message instead of a mystery tab death.
 
 ## v0.5.1 — Housekeeping: one check command, one service worker, a leaner repo
 
@@ -93,7 +94,7 @@ The bitgpu project documents ready-made manifests for Bonsai 1.7B, 4B, and 8B, w
 | Qwen 0.5B | MLC/WebLLM | Known-good baseline | small |
 | Bonsai 1.7B Q1 | bitgpu/WebGPU | Confirmed working | ~240–290 MB class |
 | Bonsai 4B Q1 | bitgpu/WebGPU | Experimental | ~570 MB class |
-| Bonsai 27B Q1 | bitgpu/WebGPU | Desktop-class experiment (iPhone first) | streamed ~3.8 GB every launch |
+| Bonsai 27B Q1 | bitgpu/WebGPU | Desktop-class experiment (iPhone first) | load from a local GGUF file (no download) or stream ~3.8 GB |
 
 ## Run
 
@@ -109,9 +110,9 @@ boot probe when Chromium is installed). CI runs it on every push.
 
 ## Important
 
-The first time a WebLLM model (Qwen) is used, its weights are downloaded and cached in IndexedDB, so later launches are local. Bonsai weights are cached on device through the Cache API after their first download, so later launches stream from disk — or straight from the network if storage is full. The application itself does not need a model server.
+The first time a WebLLM model (Qwen) is used, its weights are downloaded and cached in IndexedDB, so later launches are local. Bonsai weights are cached on device through the Cache API after their first download (1.7B; bigger models stream), so later launches stream from disk — or straight from the network if storage is full. Any Bonsai model can instead be loaded from a local file via the model sheet's "Load from a file…" picker, which bypasses downloads entirely.
 
-Switching models after one is loaded reloads the PWA so the WebGPU runtime is cleanly recreated.
+Switching models after one is loaded reloads the PWA so the WebGPU runtime is cleanly recreated — except after "Load from a file…", where the picked file can't outlive a reload, so that path disposes the old engine and starts the new one in-session instead.
 
 ## Version history
 
