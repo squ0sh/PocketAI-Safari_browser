@@ -127,6 +127,7 @@ let stopRequested = false;
 
 let chats = loadChats();
 let active = chats[0].id;
+let lastHW = null;          // last inspect() result, for honest OOM messaging
 
 const $ = (s) => document.querySelector(s);
 
@@ -266,16 +267,28 @@ function addFileControls() {
   fileButton.textContent = "Load from a file…";
   fileButton.onclick = window.pickModelFile;
 
-  const dl = document.createElement("a");
-  dl.className = "model-download";
-  const big = MODELS.find((m) => m.id === "Bonsai-27B-bitgpu");
-  dl.href = big ? big.dataUrl : "#";
-  dl.download = "";
-  dl.target = "_blank";
-  dl.rel = "noopener";
-  dl.textContent = "or save the 27B weights to Files first";
+  const saveRow = document.createElement("div");
+  saveRow.className = "model-save-row";
 
-  fileRow.append(fileButton, dl);
+  const saveLabel = document.createElement("span");
+  saveLabel.className = "model-save-label";
+  saveLabel.textContent = "Save to Files:";
+
+  saveRow.append(saveLabel);
+
+  for (const m of MODELS) {
+    if (m.runtime !== "bitgpu") continue;
+    const chip = document.createElement("a");
+    chip.className = "model-save-link";
+    chip.href = m.dataUrl;
+    chip.download = "";
+    chip.target = "_blank";
+    chip.rel = "noopener";
+    chip.textContent = m.name.replace(/^Bonsai /, "").replace(/ Q1.*$/, "");
+    saveRow.append(chip);
+  }
+
+  fileRow.append(fileButton, saveRow);
   modelList.append(fileRow);
 }
 
@@ -441,6 +454,11 @@ function stopGeneration() {
 // Human-readable megabytes for the download counter.
 function fmtMB(bytes) {
   return `${Math.floor((bytes || 0) / 1048576)} MB`;
+}
+
+// Human-readable gigabytes for device memory caps.
+function fmtGB(bytes) {
+  return `${(Math.round((bytes || 0) / 1048576) / 1024).toFixed(1)} GB`;
 }
 
 // Preflight for heavyweight models that stream into memory with no persistent
@@ -649,6 +667,7 @@ async function loadModel() {
      * attempting to initialize a local model.
      */
     h = await inspect();
+    lastHW = h;
     hardwareBox.hidden = false;
     showHW(h);
   } else {
@@ -691,8 +710,17 @@ async function loadModel() {
 
     if (m.runtime === "bitgpu") {
       if (pickedFile) {
-        progressText.textContent =
-          `Loading weights from a local file (no download) · ${m.name}...`;
+        if (m.approxBytes) {
+          const cap = h?.maxBuffer ? fmtGB(h.maxBuffer) : null;
+          progressText.textContent =
+            `Heads-up: ${m.name} needs ~${fmtGB(m.approxBytes)} of GPU memory` +
+            (cap ? ` (device storage-buffer cap ≈ ${cap})` : "") +
+            `. That's the phone's ceiling — Safari may kill the tab mid-load, not a bug. Trying anyway...`;
+          await new Promise((r) => setTimeout(r, 1800));
+        } else {
+          progressText.textContent =
+            `Loading weights from a local file (no download) · ${m.name}...`;
+        }
       } else {
         await storagePreflight(m);
       }
@@ -927,9 +955,10 @@ async function loadBonsaiBitGPU(m) {
     });
   } catch (e) {
     if (e instanceof GpuOutOfMemoryError) {
+      const cap = lastHW?.maxBuffer ? ` (this device's storage-buffer cap ≈ ${fmtGB(lastHW.maxBuffer)})` : "";
       throw new Error(
-        `This device ran out of GPU memory while loading ${m.name} (needs roughly ${fmtMB(m.approxBytes || 0)} of device memory). ` +
-          `Close other tabs and apps and try again — on a tight iPhone this is often the limit.`
+        `This device ran out of GPU memory while loading ${m.name} (needs roughly ${fmtGB(m.approxBytes || 0)} of device memory${cap}). ` +
+          `Close other tabs and apps and try again — on a tight iPhone this is often the limit, and Safari may kill the tab first.`
       );
     }
     if (e instanceof WebGPUUnavailableError) {
