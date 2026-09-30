@@ -29,7 +29,8 @@ for 1-bit Bonsai models — with MLC/WebLLM as the baseline runtime and an optio
 
 Every Bonsai row exposes a **"Save to Files"** chip (Safari's resumable download) and a
 **"Load from a file…"** picker, so any model can run straight from a local `.gguf` —
-no re-downloading, no web-storage quota involved.
+no re-downloading, no web-storage quota involved. 1.7B and 4B also load offline from the
+on-device weight cache once they've loaded online; 8B and 27B use the file while offline.
 
 Qwen3 1.7B is intentionally omitted from this build while Bonsai bitgpu testing continues.
 
@@ -109,11 +110,13 @@ Remote by design — don't use it for messages you want to keep entirely on-devi
 
 ## Important
 
-WebLLM weights persist in IndexedDB. Bonsai weights cache through the Cache API up to
-~384 MB (1.7B; iOS Safari crashes its page process on larger `cache.put` bodies, and its
-Cache quota is ~1 GB — so bigger models stream from the network each launch rather than
-drain phone memory). **Any** Bonsai model can instead be loaded from a local file via
-"Load from a file…", bypassing downloads entirely. A one-shot `navigator.storage.persist()`
+WebLLM weights persist in IndexedDB. Bonsai **1.7B and 4B weights** cache through the Cache API
+(store capped at 640 MB — iOS Safari crashes its page process on larger `cache.put` bodies and its
+Cache quota is ~1 GB, so **8B / 27B** stream from the network each launch). Every Bonsai model's
+small support files — manifest, aux, and the tokenizer — are cached too, so **any model that has
+ever loaded online boots again in airplane mode**: 1.7B/4B straight from the cached weights, and
+**8B/27B from a saved GGUF file** ("Load from a file…", which never touches the cache — the tokenizer
+the file-load needs is served from its cached copy). A one-shot `navigator.storage.persist()`
 reduces eviction odds, and the service worker ignores cross-origin fetches and never
 deletes `pocket-ai-models-*`, so shell updates can't wipe a multi-GB model.
 
@@ -125,7 +128,7 @@ reload, so that path disposes the old engine and starts the new one in-session i
 
 ### v0.6.0
 
-- **Bonsai weights cached on device (≤ ~384 MB)** via a Cache API-backed `fetchStream`: first launch downloads once, later launches stream from disk — instant and offline-capable. Bigger models fall back to plain network streaming rather than risk iOS's ~1.5 GB `cache.put` Jetsam crash.
+- **Bonsai weights cached on device — 1.7B (~290 MB) and 4B (~570 MB)** via a Cache API-backed `fetchStream`: first launch downloads once, later launches stream from disk — instant and offline-capable. 8B/27B out-grow iOS's ~1 GB Cache quota, so they stream from the network each launch (or load from a saved file). The manifest, aux, and tokenizer files cache too, so whatever has loaded online once also boots in airplane mode.
 - **"Load from a file…" for every Bonsai model.** Pick a saved `Bonsai-*.gguf` from Files; the app parses the GGUF header in place (`fromGgufBytes`) and streams weights straight from the file. Per-model **"Save to Files"** chips hand Safari a resumable background download. No re-downloads, no quota games.
 - **Honest 27B ceiling.** A heavyweight file-load shows a heads-up about the ~3.8 GB GPU footprint and the device's storage-buffer cap before it starts; caught OOM errors name the cap too. On a phone, Safari can still JetSam the tab silently — that's the device, not the app.
 - **PWA iPhones finally recognize.** The manifest + icon lived at the repo root instead of `public/`, so iOS was handed an HTML page as its manifest and home-screen icon. Now `/manifest.webmanifest`, `/icon.svg`, and PNG icons (180/192/512) actually ship, with `apple-touch-icon`, `apple-mobile-web-app-capable`, and a `black-translucent` status bar.

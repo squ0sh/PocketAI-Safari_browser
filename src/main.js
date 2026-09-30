@@ -822,10 +822,17 @@ async function loadOnlineAssist() {
 
 const MODEL_CACHE = "pocket-ai-models-v1";
 // iOS Safari crashes its tab process when page-side cache.put() materializes a
-// body much beyond ~1.5GB (Jetsam), and its Cache API quota is ~1GB — 4B/8B/27B
-// blow straight through it. Cap the store to what 1.7B needs; bigger models
-// stream from the network every launch instead (the pre-v0.6.0 behavior).
-const MODEL_CACHE_MAX_BYTES = 384 * 1024 * 1024;
+// body beyond ~1.5GB (Jetsam), and its Cache API quota is ~1GB. 1.7B (~290MB)
+// and 4B (~570MB) fit inside both; 8B (~1.16GB) and 27B (~3.8GB) blow through
+// the quota, so those stream from the network each launch (or load from a saved
+// GGUF file — the file path never touches the cache).
+const MODEL_CACHE_MAX_BYTES = 640 * 1024 * 1024;
+
+// Small metadata (manifest.json, *.aux.bin, tokenizer.json/config): cached so
+// the app boots a model fully offline once it has ever loaded online. Network-
+// first so updates flow through; the cache fallback covers airplane mode.
+const META_CACHE = "pocket-ai-meta-v1";
+const META_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 
 // Serve the weights GGUF from a persistent Cache API store when available.
 // First launch: bitgpu streams the live response while the same stream is
@@ -851,7 +858,16 @@ async function cachedModelStream(url) {
     cache = null;
   }
 
-  const response = await fetch(url);
+  const response = await fetch(url).catch((e) => {
+    if (!navigator.onLine) {
+      throw new Error(
+        `You're offline and this model's weights aren't saved on this device yet. ` +
+          `Connect to the internet once, or load the model from a saved GGUF file ` +
+          `(model sheet → "Load from a file…").`
+      );
+    }
+    throw e;
+  });
   if (!response.ok || !response.body) {
     throw new Error(`Could not fetch model data: HTTP ${response.status}`);
   }
@@ -868,11 +884,66 @@ async function cachedModelStream(url) {
   return response.body;
 }
 
+// Network-first fetch with a Cache API fallback, shared by manifest/aux/tokenizer.
+// Online: fetch and store (tiny files) so the app works offline later. Offline:
+// serve the stored copy. Never stores anything big.
+async function metaFetch(url) {
+  let cache = null;
+  try {
+    cache = await caches.open(META_CACHE);
+    if (cache) {
+      const hit = await cache.match(url);
+      if (hit && hit.ok) return hit;
+    }
+  } catch {
+    cache = null;
+  }
+  const res = await fetch(url).catch((e) => {
+    if (!navigator.onLine) {
+      throw new Error(
+        `You're offline and this model's support files (manifest/tokenizer) aren't ` +
+          `saved on this device yet. Connect once so they cache, then airplane mode works.`
+      );
+    }
+    throw e;
+  });
+  if (!res.ok) throw new Error(`Could not fetch ${url}: HTTP ${res.status}`);
+  if (cache) {
+    const len = Number(res.headers.get("content-length") || 0);
+    if (len > 0 && len <= META_CACHE_MAX_BYTES) {
+      cache.put(url, res.clone()).catch(() => {});
+    }
+  }
+  return res;
+}
+
+// bitgpu engine/chat hooks: createEngine.fetchJson (manifest),
+// createEngine.fetchArrayBuffer (aux.bin), createChat.fetchJson (tokenizer).
+async function cacheFirstJson(url) {
+  const res = await metaFetch(url);
+  return res.json();
+}
+
+async function cacheFirstBytes(url) {
+  const res = await metaFetch(url);
+  return res.arrayBuffer();
+}
+
+// Pre-cache the tokenizer files as soon as a load starts, so even a model whose
+// load dies mid-stream (27B Jetsam on a phone) still leaves its tokenizer behind
+// for a later offline file-load. Never blocks the load itself.
+function prefetchTokenizers(m) {
+  cacheFirstJson(m.tokenizerJsonUrl).catch(() => {});
+  cacheFirstJson(m.tokenizerConfigUrl).catch(() => {});
+}
+
 async function loadBonsaiBitGPU(m) {
   engineRuntime = "bitgpu";
 
   progressText.textContent =
     `Starting browser-native 1-bit runtime · ${m.name}...`;
+
+  prefetchTokenizers(m);
 
   const ggufFile = pickedFile;
   pickedFile = null;
@@ -909,6 +980,8 @@ async function loadBonsaiBitGPU(m) {
             manifestUrl: m.manifestUrl,
             auxUrl: m.auxUrl,
             dataUrl: m.dataUrl,
+            fetchJson: cacheFirstJson,
+            fetchArrayBuffer: cacheFirstBytes,
             fetchStream: cachedModelStream,
           }),
       kvCache: m.kvCache,
@@ -970,6 +1043,8 @@ async function loadBonsaiBitGPU(m) {
   chatEngine = await createBitGPUChat(
     engine,
     {
+      fetchJson: cacheFirstJson,
+
       tokenizerJsonUrl:
         m.tokenizerJsonUrl,
 
