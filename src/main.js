@@ -26,11 +26,13 @@ const MODELS = [
       "https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX/resolve/main/tokenizer.json",
     tokenizerConfigUrl:
       "https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX/resolve/main/tokenizer_config.json",
-    maxSeqLen: 4096,
-    kvCache: "q8",
-  },
-  {
-    id: "Bonsai-4B-bitgpu",
+maxSeqLen: 4096,
+    kvCache: "q8",
+    kvBytesPerToken: 31 * 1024,
+    generation: { temperature: 0.7, topP: 0.9, topK: 40 },
+  },
+  {
+    id: "Bonsai-4B-bitgpu",
     name: "Bonsai 4B Q1",
     tier: "1-bit",
     description: "Larger 1-bit model · ~570 MB · bitgpu WebGPU.",
@@ -45,11 +47,13 @@ const MODELS = [
       "https://huggingface.co/onnx-community/Bonsai-4B-ONNX/resolve/main/tokenizer.json",
     tokenizerConfigUrl:
       "https://huggingface.co/onnx-community/Bonsai-4B-ONNX/resolve/main/tokenizer_config.json",
-    maxSeqLen: 4096,
-    kvCache: "q8",
-  },
-  {
-    id: "Bonsai-8B-bitgpu",
+maxSeqLen: 4096,
+    kvCache: "q8",
+    kvBytesPerToken: 79 * 1024,
+    generation: { temperature: 0.7, topP: 0.9, topK: 40 },
+  },
+  {
+    id: "Bonsai-8B-bitgpu",
     name: "Bonsai 8B Q1",
     tier: "1-bit · Experimental",
     description: "8B parameter 1-bit model · ~1.16 GB · bitgpu WebGPU.",
@@ -64,9 +68,11 @@ const MODELS = [
       "https://huggingface.co/onnx-community/Bonsai-8B-ONNX/resolve/main/tokenizer.json",
     tokenizerConfigUrl:
       "https://huggingface.co/onnx-community/Bonsai-8B-ONNX/resolve/main/tokenizer_config.json",
-    maxSeqLen: 8192,
-    kvCache: "q8",
-  },
+maxSeqLen: 8192,
+    kvCache: "q8",
+    kvBytesPerToken: 88 * 1024,
+    generation: { temperature: 0.7, topP: 0.9, topK: 40 },
+  },
   {
     id: "Bonsai-27B-bitgpu",
     name: "Bonsai 27B Q1",
@@ -110,10 +116,78 @@ const SYSTEM_PROMPT =
 
 // v0.4.5: ephemeral-by-design chats. Session storage survives the mandatory
 // model-switch reload but dies with the tab; download is how you keep things.
+// v0.6.1: transcripts are also durably mirrored into IndexedDB (private,
+// local, offline), and short bitgpu conversations keep a KV snapshot there.
 const chatStore = {
   get: () => sessionStorage.getItem(CHATKEY),
   set: (v) => sessionStorage.setItem(CHATKEY, v),
 };
+
+const IDB_NAME = "pocket-ai";
+const IDB_VERSION = 1;
+const IDB_CHATS = "chats";
+const IDB_KV = "kv";
+let idb = null;
+
+function idbOpen() {
+  if (idb) return Promise.resolve(idb);
+  if (!("indexedDB" in window)) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+    req.onupgradeneeded = () => {
+      const d = req.result;
+      if (!d.objectStoreNames.contains(IDB_CHATS))
+        d.createObjectStore(IDB_CHATS, { keyPath: "id" });
+      if (!d.objectStoreNames.contains(IDB_KV))
+        d.createObjectStore(IDB_KV, { keyPath: "key" });
+    };
+    req.onsuccess = () => { idb = req.result; resolve(idb); };
+    req.onerror = () => resolve(null);
+    req.onblocked = () => resolve(null);
+  });
+}
+
+function idbPut(store, value) {
+  idbOpen().then((db) => {
+    if (!db) return;
+    try {
+      db.transaction(store, "readwrite").objectStore(store).put(value);
+    } catch {}
+  });
+}
+
+function idbDelete(store, key) {
+  idbOpen().then((db) => {
+    if (!db) return;
+    try {
+      db.transaction(store, "readwrite").objectStore(store).delete(key);
+    } catch {}
+  });
+}
+
+function idbGet(store, key) {
+  return idbOpen().then(
+    (db) =>
+      new Promise((resolve) => {
+        if (!db) return resolve(undefined);
+        const rq = db.transaction(store, "readonly").objectStore(store).get(key);
+        rq.onsuccess = () => resolve(rq.result);
+        rq.onerror = () => resolve(undefined);
+      })
+  );
+}
+
+function idbGetAll(store) {
+  return idbOpen().then(
+    (db) =>
+      new Promise((resolve) => {
+        if (!db) return resolve([]);
+        const rq = db.transaction(store, "readonly").objectStore(store).getAll();
+        rq.onsuccess = () => resolve(rq.result || []);
+        rq.onerror = () => resolve([]);
+      })
+  );
+}
 
 let selected = localStorage.getItem(KEY) || MODELS[0].id;
 let pickedFile = null;   // GGUF picked via "Load from a file…"; consumed on load
@@ -322,36 +396,71 @@ function render() {
   });
 }
 
+function freshChat() {
+  return {
+    id: crypto.randomUUID(),
+    title: "New Chat",
+    messages: [],
+    createdAt: Date.now(),
+  };
+}
+
 function loadChats() {
   try {
     // One-time migration: chats that lived in localStorage (≤0.4.4) move into
-    // this session, then the durable copy is removed.
+    // the session mirror, then the durable copy is removed.
     const legacy = localStorage.getItem(CHATKEY);
     const current = chatStore.get();
     if (legacy && !current) {
       chatStore.set(legacy);
       localStorage.removeItem(CHATKEY);
     }
-    const x = JSON.parse(
-      chatStore.get() || "null"
-    );
+   const x = JSON.parse(
+      chatStore.get() || "null"
+    );
 
-    if (Array.isArray(x) && x.length) {
-      return x;
-    }
-  } catch {}
+    if (Array.isArray(x) && x.length) {
+      return x.map((c) => ({
+        id: c.id || crypto.randomUUID(),
+        title: c.title || "New Chat",
+        messages: Array.isArray(c.messages) ? c.messages : [],
+        createdAt: c.createdAt || Date.now(),
+      }));
+    }
+  } catch {}
 
-  return [
-    {
-      id: crypto.randomUUID(),
-      title: "New Chat",
-      messages: [],
-    },
-  ];
+  return [freshChat()];
 }
 
 function save() {
-  chatStore.set(JSON.stringify(chats));
+  const now = Date.now();
+  for (const c of chats) {
+    c.updatedAt = now;
+    idbPut(IDB_CHATS, c);
+  }
+  chatStore.set(JSON.stringify(chats));
+  renderHistory();
+}
+
+// Rebuild the chat list from the durable IndexedDB copy (authoritative:
+// survives tab closes). The session mirror stays as the synchronous first
+// paint / reload scratch, then this merges in whatever durable data exists.
+async function hydrateChatsFromIDB() {
+  const rows = await idbGetAll(IDB_CHATS);
+  if (!rows || !rows.length) return;
+  rows.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const activeHadMessages = chats.some(
+    (x) => x.id === active && x.messages.length
+  );
+  chats = rows.map((c) => ({
+    id: c.id,
+    title: c.title || "New Chat",
+    messages: Array.isArray(c.messages) ? c.messages : [],
+    createdAt: c.createdAt || Date.now(),
+  }));
+  if (!activeHadMessages) active = chats[0].id;
+  chatStore.set(JSON.stringify(chats));
+  render();
   renderHistory();
 }
 
@@ -370,6 +479,8 @@ function renderHistory() {
     open.className = "history-open";
     open.textContent = c.title || "New Chat";
     open.onclick = () => {
+      saveKvSnapshot(true);
+      resetChatKv();
       active = c.id;
       save();
       render();
@@ -418,8 +529,19 @@ function downloadChat(c) {
 
 function deleteChat(id) {
   chats = chats.filter((x) => x.id !== id);
+  idbDelete(IDB_CHATS, id);
+  // Tidy matching KV snapshots (chat id + every model that may have it).
+  if (idb) {
+    try {
+      const tx = idb.transaction(IDB_KV, "readwrite");
+      const st = tx.objectStore(IDB_KV);
+      for (const m of MODELS) {
+        if (m.runtime === "bitgpu") st.delete(`${m.id}::${id}`);
+      }
+    } catch {}
+  }
   if (!chats.length) {
-    chats = [{ id: crypto.randomUUID(), title: "New Chat", messages: [] }];
+    chats = [freshChat()];
   }
   if (active === id) active = chats[0].id;
   save();
@@ -659,6 +781,7 @@ async function loadModel() {
   progress.style.width = "0%";
 
   const m = model();
+  localStorage.setItem("pocket-ai-last-source", pickedFile ? "file" : "live");
   let h = null;
 
   if (!isOnlineModel(m)) {
@@ -734,11 +857,14 @@ async function loadModel() {
       await loadWebLLM(m);
     }
 
-    status.textContent = isOnlineModel(m)
+status.textContent = isOnlineModel(m)
       ? "Online Assist · ready"
       : `Local AI · ${m.name} · WebGPU`;
 
-    progress.style.width = "100%";
+    const hint = $("#reloadHint");
+    if (hint) hint.hidden = true;
+
+    progress.style.width = "100%";
 
     progressText.textContent = isOnlineModel(m)
       ? "Ready · messages will use your configured online service."
@@ -929,6 +1055,101 @@ async function cacheFirstBytes(url) {
   return res.arrayBuffer();
 }
 
+// --- KV-context persistence (durable, instant-resume chats) ---
+
+const KV_MAX_BYTES = 64 * 1024 * 1024;
+const KV_MIN_INTERVAL = 5000;
+let lastKvAt = 0;
+
+function kvKey(modelId, chatId) {
+  return `${modelId}::${chatId}`;
+}
+
+// Prewarm the pinned system prompt so the first real turn is a cheap cache
+// append and delta snapshots have a stable prefix to ride on.
+async function prewarmChat() {
+  if (engineRuntime !== "bitgpu" || !chatEngine) return;
+  try {
+    await chatEngine.prewarm([
+      { role: "system", content: SYSTEM_PROMPT },
+    ]);
+  } catch {}
+}
+
+// Make sure a switched/discarded conversation can never serve the wrong KV.
+function resetChatKv() {
+  try {
+    chatEngine?.reset?.();
+  } catch {}
+}
+
+// Persist the active chat's context window so a later launch re-opens it with
+// its KV cache intact (instant resume, no re-prefill). Skipped for models
+// without kvBytesPerToken (27B), when the context is too large to store
+// comfortably, or while the engine is mid-generation. `force` bypasses the
+// rate limit (used on tab close / model switch).
+async function saveKvSnapshot(force = false) {
+  if (engineRuntime !== "bitgpu" || !chatEngine || busy) return;
+  const m = model();
+  if (!m.kvBytesPerToken) return;
+  const c = chats.find((x) => x.id === active);
+  if (!c || !c.messages.length) return;
+  const now = Date.now();
+  if (!force && now - lastKvAt < KV_MIN_INTERVAL) return;
+  try {
+    const msgs = [
+      { role: "system", content: SYSTEM_PROMPT },
+      ...c.messages,
+    ];
+    const tokens = chatEngine.countTokens(msgs);
+    if (tokens * m.kvBytesPerToken > KV_MAX_BYTES) return;
+    let snap = null;
+    try {
+      snap = await chatEngine.save({ delta: true });
+    } catch {
+      try {
+        snap = await chatEngine.save();
+      } catch {
+        return;
+      }
+    }
+    if (!snap) return;
+    lastKvAt = now;
+    idbPut(IDB_KV, {
+      key: kvKey(m.id, active),
+      chatId: active,
+      modelId: m.id,
+      savedAt: now,
+      snap,
+    });
+  } catch {}
+}
+
+// Rehydrate the restored engine's KV for the active chat. On success the
+// snapshot's committed transcript becomes the UI's source of truth.
+async function tryRestoreKv(chatId) {
+  if (engineRuntime !== "bitgpu" || !chatEngine) return false;
+  const m = model();
+  try {
+    const rec = await idbGet(IDB_KV, kvKey(m.id, chatId));
+    if (!rec?.snap || rec.chatId !== chatId) return false;
+    await chatEngine.restore(rec.snap);
+    const c = chats.find((x) => x.id === chatId);
+    const committed = rec.snap.committed;
+    if (c && Array.isArray(committed) && committed.length) {
+      c.messages = committed.map((mm) => ({ ...mm }));
+      const firstUser = c.messages.find((mm) => mm.role === "user");
+      if (c.title === "New Chat" && firstUser) {
+        c.title = firstUser.content.slice(0, 42);
+      }
+      save();
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Pre-cache the tokenizer files as soon as a load starts, so even a model whose
 // load dies mid-stream (27B Jetsam on a phone) still leaves its tokenizer behind
 // for a later offline file-load. Never blocks the load itself.
@@ -1052,6 +1273,9 @@ async function loadBonsaiBitGPU(m) {
         m.tokenizerConfigUrl,
     }
   );
+
+  await prewarmChat();
+  await tryRestoreKv(active);
 }
 
 async function sendMessage(e) {
@@ -1183,15 +1407,16 @@ async function sendMessage(e) {
       "Generation failed. Model initialization succeeded.";
 
     save();
-  } finally {
+} finally {
     if (engineRuntime !== "online") setGenerating(false);
-    busy = false;
+    busy = false;
 
-    input.disabled = false;
-    send.disabled = false;
+    input.disabled = false;
+    send.disabled = false;
 
-    input.focus();
-  }
+    saveKvSnapshot(false);
+    input.focus();
+  }
 }
 
 // Rough token estimate (~4 chars/token English) — conservative, no tokenizer needed.
@@ -1200,22 +1425,62 @@ function estTokens(text) {
 }
 
 // Trim history to fit the context window. The system prompt is pinned, the
-// newest turns always survive, oldest drop first.
-function fitPrompt(messageList, contextTokens, reserve) {
+// newest turns always survive, oldest drop first. When `count` is provided it
+// measures a candidate prompt with the real tokenizer (bitgpu); otherwise the
+// cheap ~4-char/token estimate stands in (WebLLM has no exposed tokenizer).
+async function fitPrompt(messageList, contextTokens, reserve, count) {
   const budget = contextTokens - reserve;
   const hasSystem = messageList[0]?.role === "system";
   const head = hasSystem ? [messageList[0]] : [];
   const rest = messageList.slice(hasSystem ? 1 : 0);
-  let used = estTokens(head[0]?.content || "");
-  const kept = [];
-  for (let i = rest.length - 1; i >= 0 && kept.length < 30; i--) {
-    const m = rest[i];
-    const cost = estTokens(m.content) + 4;
-    if (kept.length && used + cost > budget) break;
-    kept.unshift(m);
-    used += cost;
+  const full = head.concat(rest);
+
+  if (!count) {
+    let used = estTokens(head[0]?.content || "");
+    const kept = [];
+    for (let i = rest.length - 1; i >= 0 && kept.length < 30; i--) {
+      const m = rest[i];
+      const cost = estTokens(m.content) + 4;
+      if (kept.length && used + cost > budget) break;
+      kept.unshift(m);
+      used += cost;
+    }
+    return head.concat(kept);
   }
-  return head.concat(kept);
+
+  const dropOldest = (l) =>
+    l.length > (hasSystem ? 1 : 0)
+      ? [l[0], ...l.slice(hasSystem ? 2 : 1)]
+      : l;
+  const estOf = (l) =>
+    estTokens(l.map((x) => x.content).join("\n")) + l.length * 4;
+
+  let total;
+  try {
+    total = await count(full);
+  } catch {
+    return fitPrompt(messageList, contextTokens, reserve, null);
+  }
+  if (total <= budget) return full;
+
+  // Cheap pass to overshoot under budget, then an exact verification pass.
+  let list = full;
+  while (list.length > (hasSystem ? 2 : 1) && estOf(list) > budget) {
+    list = dropOldest(list);
+  }
+  while (list.length > (hasSystem ? 1 : 0)) {
+    let cost;
+    try {
+      cost = await count(list);
+    } catch {
+      break;
+    }
+    if (cost <= budget) break;
+    const next = dropOldest(list);
+    if (next.length === list.length) break;
+    list = next;
+  }
+  return list;
 }
 
 // One generation segment for the active LOCAL runtime (WebLLM or bitgpu).
@@ -1225,7 +1490,12 @@ function fitPrompt(messageList, contextTokens, reserve) {
 async function generateSegment(c, { extra = [], onText = () => {} } = {}) {
   if (engineRuntime === "bitgpu") {
     const generation = model().generation || { temperature: 0.7, topP: 0.9 };
-    const messages = fitPrompt(c.messages.concat(extra), CONTEXT_TOKENS, LOCAL_MAX_TOKENS);
+    const messages = await fitPrompt(
+      [{ role: "system", content: SYSTEM_PROMPT }, ...c.messages, ...extra],
+      CONTEXT_TOKENS,
+      LOCAL_MAX_TOKENS,
+      (msgs) => chatEngine.countTokens(msgs)
+    );
     const ctl = new AbortController();
     genAbort = ctl;
     let res = null;
@@ -1249,7 +1519,7 @@ async function generateSegment(c, { extra = [], onText = () => {} } = {}) {
   }
 
   const m = model();
-  const messages = fitPrompt(
+  const messages = await fitPrompt(
     [{ role: "system", content: SYSTEM_PROMPT }, ...c.messages, ...extra],
     CONTEXT_TOKENS,
     LOCAL_MAX_TOKENS
@@ -1326,6 +1596,7 @@ function offerContinue(c, bubble, partial, count) {
       busy = false;
       input.disabled = false;
       send.disabled = false;
+      saveKvSnapshot(false);
       input.focus();
     }
   };
@@ -1416,13 +1687,11 @@ backdrop.onclick = () => {
 };
 
 $("#newChatButton").onclick = () => {
-  const c = {
-    id: crypto.randomUUID(),
-    title: "New Chat",
-    messages: [],
-  };
+  saveKvSnapshot(true);
+  resetChatKv();
+  const c = freshChat();
 
-  chats.unshift(c);
+  chats.unshift(c);
 
   active = c.id;
 
@@ -1441,6 +1710,12 @@ function onFilePicked(file) {
     return;
   }
 
+  // Persist the current engine's context for whatever model is active BEFORE
+  // switching selected (snapshots are keyed per model).
+  if (engine) {
+    saveKvSnapshot(true);
+  }
+
   pickedFile = file;
   selected = m.id;
   localStorage.setItem(KEY, selected);
@@ -1451,6 +1726,7 @@ function onFilePicked(file) {
   // In-session switch: dispose the previous engine instead of the usual
   // location.reload(), because reload would drop the File handle.
   if (engine) {
+    resetChatKv();
     try { engine.dispose?.(); } catch {}
     try { chatEngine?.dispose?.(); } catch {}
     engine = null;
@@ -1458,6 +1734,7 @@ function onFilePicked(file) {
     engineRuntime = null;
   }
 
+  localStorage.setItem("pocket-ai-last-source", "file");
   load.disabled = false;
   loadModel();
 }
@@ -1490,6 +1767,9 @@ renderModels();
 render();
 renderHistory();
 
+// Merge the durable (tab-close-proof) copy of the chats in the background.
+hydrateChatsFromIDB();
+
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker
     .register("/sw.js")
@@ -1500,4 +1780,38 @@ if ("serviceWorker" in navigator) {
 // storage pressure. Best-effort; iOS grants this without a user prompt.
 if (navigator.storage?.persist) {
   navigator.storage.persist().catch(() => {});
+}
+
+// Save a final KV snapshot when the tab is going away (close, reload, model
+// switch, backgrounding) so the next open can resume instantly.
+const persistBeforeUnload = () => {
+  saveKvSnapshot(true);
+};
+window.addEventListener("pagehide", persistBeforeUnload);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) persistBeforeUnload();
+});
+
+const reloadHint = $("#reloadHint");
+if (reloadHint) {
+  reloadHint.onclick = () => {
+    reloadHint.hidden = true;
+    window.pickModelFile();
+  };
+}
+
+// Zero-tap resume: auto-load the last selected LOCAL model on open. Skipped
+// when the last session used a picked file (a File handle can't survive a
+// reload — Safari needs the pick gesture) or for the 27B (no surprise ~3.8 GB
+// stream); those get a gentle file-reload hint instead.
+const lastSource = localStorage.getItem("pocket-ai-last-source") || "live";
+const bootModel = model();
+if (bootModel.runtime === "bitgpu" && lastSource !== "live" && !engine) {
+  if (reloadHint) reloadHint.hidden = false;
+} else if (
+  bootModel.runtime !== "online" &&
+  bootModel.id !== "Bonsai-27B-bitgpu" &&
+  !engine
+) {
+  loadModel();
 }

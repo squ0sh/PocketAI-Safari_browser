@@ -124,6 +124,13 @@ Switching models after one is loaded reloads the PWA so the WebGPU runtime is cl
 recreated — except after "Load from a file…", where the picked file can't outlive a
 reload, so that path disposes the old engine and starts the new one in-session instead.
 
+Chats are **durable on-device**: transcripts mirror into IndexedDB as you chat, so closing or
+reloading the tab never loses them (and the app reopens on your last local model with zero
+taps). Context windows are **token-accurate** (bitgpu's real tokenizer, not a character guess)
+and, for local chats under ~64 MB of KV cache, the whole conversation snapshot is saved too —
+reopening resumes at high speed instead of re-prefilling everything. All of it stays on the
+phone; nothing is uploaded, and no index or transcript leaves the device.
+
 ## Version history
 
 ### v0.6.0
@@ -134,6 +141,10 @@ reload, so that path disposes the old engine and starts the new one in-session i
 - **PWA iPhones finally recognize.** The manifest + icon lived at the repo root instead of `public/`, so iOS was handed an HTML page as its manifest and home-screen icon. Now `/manifest.webmanifest`, `/icon.svg`, and PNG icons (180/192/512) actually ship, with `apple-touch-icon`, `apple-mobile-web-app-capable`, and a `black-translucent` status bar.
 - **Service worker plays nice with the model cache** — ignores cross-origin fetches, never deletes `pocket-ai-models-*`.
 - **`npm run check` guards the PWA wiring** (manifest parses as JSON, icons serve as images).
+- **Token-accurate context.** Local chats are measured with bitgpu's real tokenizer and trimmed to the model's window — the system prompt stays pinned, newest turns survive, and max-token budgets no longer silently eat your context.
+- **Higher-quality local defaults** — dedicated sampling presets (`temperature` 0.7, `topP` 0.9, `topK` 40) per Bonsai model instead of one shared guess.
+- **Durable, instantly-resumable chats.** Transcripts persist in IndexedDB across tab close/reload. For local chats that fit ~64 MB of KV cache, a snapshot of the prewarmed context is saved after each turn (and on exit), so the next open restores the conversation at speed. Chats stay purely on-device.
+- **Zero-tap resume.** Opening the app loads your last local model automatically — except a picked-file session (a File can't outlive a reload, so that shows a "Reload from a saved file…" chip instead) and the 27B (no surprise ~3.8 GB stream).
 
 ### v0.5.1 — Housekeeping
 
