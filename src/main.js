@@ -1055,6 +1055,10 @@ async function cacheFirstBytes(url) {
   return res.arrayBuffer();
 }
 
+// Pending background prewarm/KV-restore for the loaded engine. The first local
+// send awaits it so a restored context is never raced by a fresh prefill.
+let kvReady = null;
+
 // --- KV-context persistence (durable, instant-resume chats) ---
 
 const KV_MAX_BYTES = 64 * 1024 * 1024;
@@ -1261,7 +1265,7 @@ async function loadBonsaiBitGPU(m) {
     throw e;
   }
 
-  chatEngine = await createBitGPUChat(
+chatEngine = await createBitGPUChat(
     engine,
     {
       fetchJson: cacheFirstJson,
@@ -1274,8 +1278,14 @@ async function loadBonsaiBitGPU(m) {
     }
   );
 
-  await prewarmChat();
-  await tryRestoreKv(active);
+  // Prewarm/restore run in the background after the load reports "ready" — they
+  // only prime the KV cache, so a slow (or hanging) prewarm must never stall the
+  // load itself. The first send awaits `kvReady` (see generateSegment).
+  kvReady = (async () => {
+    await prewarmChat();
+    await tryRestoreKv(active);
+  })();
+  kvReady.catch((e) => console.warn("Pocket AI: prewarm/restore skipped:", e));
 }
 
 async function sendMessage(e) {
@@ -1490,6 +1500,14 @@ async function fitPrompt(messageList, contextTokens, reserve, count) {
 async function generateSegment(c, { extra = [], onText = () => {} } = {}) {
   if (engineRuntime === "bitgpu") {
     const generation = model().generation || { temperature: 0.7, topP: 0.9 };
+    // The engine's KV may still be prewarming/restoring from the load that just
+    // finished — wait it out so the first turn reuses the restored context
+    // instead of racing it with a fresh prefill.
+    if (kvReady) {
+      const pending = kvReady;
+      kvReady = null;
+      await pending.catch(() => {});
+    }
     const messages = await fitPrompt(
       [{ role: "system", content: SYSTEM_PROMPT }, ...c.messages, ...extra],
       CONTEXT_TOKENS,
@@ -1800,6 +1818,19 @@ if (reloadHint) {
   };
 }
 
+// True when the model's weights are already sitting in the on-device cache
+// (i.e. this model can boot with no network at all).
+async function weightsCached(m) {
+  if (!m || m.runtime !== "bitgpu") return false;
+  try {
+    const cache = await caches.open(MODEL_CACHE);
+    const hit = await cache.match(m.dataUrl);
+    return !!(hit && hit.ok);
+  } catch {
+    return false;
+  }
+}
+
 // Zero-tap resume: auto-load the last selected LOCAL model on open. Skipped
 // when the last session used a picked file (a File handle can't survive a
 // reload — Safari needs the pick gesture) or for the 27B (no surprise ~3.8 GB
@@ -1813,5 +1844,22 @@ if (bootModel.runtime === "bitgpu" && lastSource !== "live" && !engine) {
   bootModel.id !== "Bonsai-27B-bitgpu" &&
   !engine
 ) {
-  loadModel();
+  // Offline: only auto-load a model we know is fully saved on the device.
+  // Anything else would fail the moment it tries the network — stay quiet and
+  // let the user pick a cached model or a saved .gguf instead.
+  if (navigator.onLine) {
+    loadModel();
+  } else {
+    weightsCached(bootModel).then((cached) => {
+      if (cached) {
+        loadModel();
+      } else {
+        status.textContent = "Offline";
+        progressText.textContent =
+          `You're offline and ${bootModel.name} isn't saved on this device yet. ` +
+          `Pick a cached model (1.7B / 4B) or load a saved .gguf file.`;
+        progressWrap.hidden = false;
+      }
+    });
+  }
 }
