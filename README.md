@@ -125,11 +125,11 @@ recreated — except after "Load from a file…", where the picked file can't ou
 reload, so that path disposes the old engine and starts the new one in-session instead.
 
 Chats are **durable on-device**: transcripts mirror into IndexedDB as you chat, so closing or
-reloading the tab never loses them (and the app reopens on your last local model with zero
-taps). Context windows are **token-accurate** (bitgpu's real tokenizer, not a character guess)
-and, for local chats under ~64 MB of KV cache, the whole conversation snapshot is saved too —
-reopening resumes at high speed instead of re-prefilling everything. All of it stays on the
-phone; nothing is uploaded, and no index or transcript leaves the device.
+reloading the tab never loses them (and the app reopens ready to go). Context windows are
+**token-accurate** (bitgpu's real tokenizer, not a character guess) and, for local chats under
+~64 MB of KV cache, the whole conversation snapshot is saved too — reopening resumes at high
+speed instead of re-prefilling everything. All of it stays on the phone; nothing is uploaded,
+and no index or transcript leaves the device.
 
 ## Version history
 
@@ -144,7 +144,8 @@ phone; nothing is uploaded, and no index or transcript leaves the device.
 - **Token-accurate context.** Local chats are measured with bitgpu's real tokenizer and trimmed to the model's window — the system prompt stays pinned, newest turns survive, and max-token budgets no longer silently eat your context.
 - **Higher-quality local defaults** — dedicated sampling presets (`temperature` 0.7, `topP` 0.9, `topK` 40) per Bonsai model instead of one shared guess.
 - **Durable, instantly-resumable chats.** Transcripts persist in IndexedDB across tab close/reload. For local chats that fit ~64 MB of KV cache, a snapshot of the prewarmed context is saved after each turn (and on exit), so the next open restores the conversation at speed. Chats stay purely on-device.
-- **Zero-tap resume.** Opening the app loads your last local model automatically — except a picked-file session (a File can't outlive a reload, so that shows a "Reload from a saved file…" chip instead) and the 27B (no surprise ~3.8 GB stream).
+- **Never downloads behind your back.** On open, the app auto-loads **only** a model whose weights are already saved on this device (a pure disk read — online or offline); a first launch just shows the model chooser, and no surprise 300 MB+ stream ever starts on its own. Pick a model → tap **Load Local AI** → it remembers itself as "installed" and resumes from disk next time.
+- **"Update site" button** (drawer footer) — pulls the newest build without deleting the app from the Home Screen: unregisters the service worker, drops the shell cache, reloads. **Your model weights, cached support files, and chats all stay put**, so updating never costs a re-download.
 
 ### v0.5.1 — Housekeeping
 

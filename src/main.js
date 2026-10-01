@@ -105,6 +105,10 @@ maxSeqLen: 8192,
 ];
 
 const KEY = "pocket-ai-selected-model-v4";
+// The last model that finished loading from the weight cache (not a file) —
+// i.e. the one that is genuinely "installed on this device". The next launch
+// resumes it without downloading anything; see the boot block at the bottom.
+const AUTOLOAD_KEY = "pocket-ai-autoload-model";
 const CHATKEY = "pocket-ai-chats-v5";
 
 // v0.4.4: longer answers, honest truncation, context-window-safe history.
@@ -781,7 +785,10 @@ async function loadModel() {
   progress.style.width = "0%";
 
   const m = model();
-  localStorage.setItem("pocket-ai-last-source", pickedFile ? "file" : "live");
+  // Captured before the file handle is consumed by the load, so a file load is
+  // never mistaken for a cached/live one.
+  const wasFile = !!pickedFile;
+  localStorage.setItem("pocket-ai-last-source", wasFile ? "file" : "live");
   let h = null;
 
   if (!isOnlineModel(m)) {
@@ -860,6 +867,12 @@ async function loadModel() {
 status.textContent = isOnlineModel(m)
       ? "Online Assist · ready"
       : `Local AI · ${m.name} · WebGPU`;
+
+    // Remember a live, cached load as "installed on this device" so the next
+    // launch can resume it straight from disk (never a download).
+    if (m.runtime === "bitgpu" && !wasFile && (await weightsCached(m))) {
+      localStorage.setItem(AUTOLOAD_KEY, m.id);
+    }
 
     const hint = $("#reloadHint");
     if (hint) hint.hidden = true;
@@ -1757,6 +1770,65 @@ function onFilePicked(file) {
   loadModel();
 }
 
+// "Update site" — pull the newest build without deleting the app from the Home
+// Screen. Only the shell is wiped: the service worker is unregistered and
+// pocket-ai-shell-* caches dropped, so the reload bypasses the old cached
+// bundle. The model weights (pocket-ai-models-*) and support files
+// (pocket-ai-meta-*) stay — an update must not cost a re-download — and chats
+// live in IndexedDB/localStorage, so nothing is lost.
+async function updateSite() {
+  const btn = $("#updateButton");
+  if (busy) {
+    if (btn) btn.textContent = "Wait for the reply to finish";
+    return;
+  }
+  if (!navigator.onLine) {
+    errorBox.textContent =
+      "You're offline — updating needs a connection. Reconnect and try again.";
+    errorBox.hidden = false;
+    return;
+  }
+  const ok = window.confirm(
+    "Clear the app's cached copy and reload the newest version?\n\n" +
+      "Your chats and any models saved on this device are kept."
+  );
+  if (!ok) return;
+
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Updating…";
+  }
+
+  // Persist the current context so the reload can resume it.
+  saveKvSnapshot(true);
+  try { engine?.dispose?.(); } catch {}
+  try { chatEngine?.dispose?.(); } catch {}
+  engine = null;
+  chatEngine = null;
+  engineRuntime = null;
+
+  try {
+    const regs = await navigator.serviceWorker?.getRegistrations?.();
+    await Promise.all((regs || []).map((r) => r.unregister().catch(() => {})));
+  } catch {}
+
+  try {
+    const keys = await caches.keys();
+    await Promise.all(
+      keys
+        .filter((k) => k.startsWith("pocket-ai-shell-"))
+        .map((k) => caches.delete(k))
+    );
+  } catch {}
+
+  location.reload();
+}
+
+const updateButton = $("#updateButton");
+if (updateButton) {
+  updateButton.onclick = updateSite;
+}
+
 const fileInput = document.createElement("input");
 fileInput.type = "file";
 fileInput.accept = ".gguf";
@@ -1831,10 +1903,13 @@ async function weightsCached(m) {
   }
 }
 
-// Zero-tap resume: auto-load the last selected LOCAL model on open. Skipped
-// when the last session used a picked file (a File handle can't survive a
-// reload — Safari needs the pick gesture) or for the 27B (no surprise ~3.8 GB
-// stream); those get a gentle file-reload hint instead.
+// Resume policy: the app never downloads anything on open. It auto-loads only a
+// model whose weights are ALREADY saved on this device (a pure disk read — fine
+// online or offline); everything else waits for the user to pick a model and
+// tap Load. So a first launch just shows the chooser, and no surprise ~300 MB+
+// stream ever starts behind the user's back.
+// Skipped: a last-session file load (a File handle can't outlive a reload —
+// shows the "reload from a saved file" hint instead) and the 27B (~3.8 GB).
 const lastSource = localStorage.getItem("pocket-ai-last-source") || "live";
 const bootModel = model();
 if (bootModel.runtime === "bitgpu" && lastSource !== "live" && !engine) {
@@ -1844,22 +1919,31 @@ if (bootModel.runtime === "bitgpu" && lastSource !== "live" && !engine) {
   bootModel.id !== "Bonsai-27B-bitgpu" &&
   !engine
 ) {
-  // Offline: only auto-load a model we know is fully saved on the device.
-  // Anything else would fail the moment it tries the network — stay quiet and
-  // let the user pick a cached model or a saved .gguf instead.
-  if (navigator.onLine) {
-    loadModel();
-  } else {
-    weightsCached(bootModel).then((cached) => {
-      if (cached) {
-        loadModel();
-      } else {
-        status.textContent = "Offline";
-        progressText.textContent =
-          `You're offline and ${bootModel.name} isn't saved on this device yet. ` +
-          `Pick a cached model (1.7B / 4B) or load a saved .gguf file.`;
-        progressWrap.hidden = false;
-      }
-    });
-  }
+  // Try the explicitly selected model first, then the last one that finished
+  // loading from the weight cache.
+  const candidates = [bootModel.id, localStorage.getItem(AUTOLOAD_KEY)];
+  (async () => {
+    for (const id of candidates) {
+      if (!id || id === "Bonsai-27B-bitgpu") continue;
+      const m = MODELS.find((x) => x.id === id);
+      if (!m || m.runtime !== "bitgpu") continue;
+      if (!(await weightsCached(m))) continue;
+      selected = m.id;
+      localStorage.setItem(KEY, selected);
+      modelButton.textContent = m.name;
+      updateWelcome();
+      loadModel();
+      return;
+    }
+    // Nothing saved on this device yet — hand the choice to the user.
+    if (!navigator.onLine) {
+      status.textContent = "Offline";
+      progressText.textContent =
+        `You're offline and ${bootModel.name} isn't saved on this device yet. ` +
+        `Pick a cached model (1.7B / 4B) or load a saved .gguf file.`;
+      progressWrap.hidden = false;
+    } else {
+      status.textContent = "Ready · choose a model to load";
+    }
+  })();
 }
