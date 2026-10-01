@@ -105,10 +105,6 @@ maxSeqLen: 8192,
 ];
 
 const KEY = "pocket-ai-selected-model-v4";
-// The last model that finished loading from the weight cache (not a file) —
-// i.e. the one that is genuinely "installed on this device". The next launch
-// resumes it without downloading anything; see the boot block at the bottom.
-const AUTOLOAD_KEY = "pocket-ai-autoload-model";
 const CHATKEY = "pocket-ai-chats-v5";
 
 // v0.4.4: longer answers, honest truncation, context-window-safe history.
@@ -418,10 +414,6 @@ function addFileControls() {
       );
       if (!ok) return;
       await purgeCachedModel(m.dataUrl);
-      // It may have been the model we resume into on the next launch.
-      if (localStorage.getItem(AUTOLOAD_KEY) === m.id) {
-        localStorage.removeItem(AUTOLOAD_KEY);
-      }
       chip.textContent = `Cleared ${m.name.replace(/^Bonsai /, "").replace(/ Q1.*$/, "")}`;
       chip.disabled = true;
       status.textContent = `${m.name} · saved copy deleted`;
@@ -953,12 +945,6 @@ if (!alive()) throw ABORTED;
     status.textContent = isOnlineModel(m)
       ? "Online Assist · ready"
       : `Local AI · ${m.name} · WebGPU`;
-
-    // Remember a live, cached load as "installed on this device" so the next
-    // launch can resume it straight from disk (never a download).
-    if (m.runtime === "bitgpu" && !wasFile && (await weightsCached(m))) {
-      localStorage.setItem(AUTOLOAD_KEY, m.id);
-    }
 
     const hint = $("#reloadHint");
     if (hint) hint.hidden = true;
@@ -2112,11 +2098,11 @@ async function weightsCached(m) {
   }
 }
 
-// Resume policy: the app never downloads anything on open. It auto-loads only a
-// model whose weights are ALREADY saved on this device (a pure disk read — fine
-// online or offline); everything else waits for the user to pick a model and
-// tap Load. So a first launch just shows the chooser, and no surprise ~300 MB+
-// stream ever starts behind the user's back.
+// Resume policy: the app never downloads anything on open, and it never changes
+// the chosen model. It auto-loads the model you selected ONLY if its weights are
+// already saved on this device (a pure disk read — fine online or offline);
+// anything else waits for you to tap Load. So a first launch just shows the
+// chooser, and no surprise 300 MB+ stream ever starts behind your back.
 // Skipped: a last-session file load (a File handle can't outlive a reload —
 // shows the "reload from a saved file" hint instead) and the 27B (~3.8 GB).
 const lastSource = localStorage.getItem("pocket-ai-last-source") || "live";
@@ -2128,28 +2114,18 @@ if (bootModel.runtime === "bitgpu" && lastSource !== "live" && !engine) {
   bootModel.id !== "Bonsai-27B-bitgpu" &&
   !engine
 ) {
-  // Try the explicitly selected model first, then the last one that finished
-  // loading from the weight cache.
-  const candidates = [bootModel.id, localStorage.getItem(AUTOLOAD_KEY)];
   (async () => {
-    for (const id of candidates) {
-      if (!id || id === "Bonsai-27B-bitgpu") continue;
-      const m = MODELS.find((x) => x.id === id);
-      if (!m || m.runtime !== "bitgpu") continue;
-      if (!(await weightsCached(m))) continue;
-      selected = m.id;
-      localStorage.setItem(KEY, selected);
-      modelButton.textContent = m.name;
-      updateWelcome();
+    // Only ever the selected model. Swapping in a different one here would
+    // silently override the user's choice.
+    if (bootModel.runtime === "bitgpu" && (await weightsCached(bootModel))) {
       loadModel();
       return;
     }
-    // Nothing saved on this device yet — hand the choice to the user.
     if (!navigator.onLine) {
       status.textContent = "Offline";
       progressText.textContent =
         `You're offline and ${bootModel.name} isn't saved on this device yet. ` +
-        `Pick a cached model (1.7B / 4B) or load a saved .gguf file.`;
+        `Pick a model you have saved (1.7B / 4B), or load a saved .gguf file.`;
       progressWrap.hidden = false;
     } else {
       status.textContent = "Ready · choose a model to load";
