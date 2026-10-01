@@ -203,6 +203,14 @@ let generating = false;
 let genAbort = null;      // AbortController for the active bitgpu segment
 let stopRequested = false;
 
+// --- load lifecycle: a load must never wedge the UI ---
+// loadToken increments for every load attempt; bumping it cancels whatever is in
+// flight (the Cancel button, a model switch, or a new load). Thrown when a load
+// discovers it was superseded, so it unwinds without touching the UI.
+let loadToken = 0;
+let loadProgressAt = 0;
+const ABORTED = Symbol("pocket-ai-load-aborted");
+
 let chats = loadChats();
 let active = chats[0].id;
 let lastHW = null;          // last inspect() result, for honest OOM messaging
@@ -222,6 +230,10 @@ const status = $("#status");
 const progressWrap = $("#progressWrap");
 const progress = $("#progress");
 const progressText = $("#progressText");
+// A tiny stand-in keeps the load lifecycle working even if the markup is edited
+// to drop the button.
+const cancelLoadButton =
+  $("#cancelLoadButton") || { hidden: true, onclick: null };
 const errorBox = $("#errorBox");
 const hardwareBox = $("#hardwareBox");
 const drawer = $("#historyDrawer");
@@ -316,18 +328,29 @@ function renderModels() {
 
     b.append(a, badge);
 
-    b.onclick = () => {
-      selected = m.id;
-      localStorage.setItem(KEY, selected);
+b.onclick = () => {
+      const changed = selected !== m.id;
+      selected = m.id;
+      localStorage.setItem(KEY, selected);
 
       modelButton.textContent = m.name;
       sheet.classList.remove("open");
       updateWelcome();
 
-      if (engine) {
-        location.reload();
-      }
-    };
+      if (engine) {
+        location.reload();
+      } else if (load.disabled) {
+        // A load is in flight (possibly stuck). Cancel it, then start the model
+        // the user just picked — choosing a different model must never be a
+        // dead end.
+        cancelLoadButton.click();
+        loadModel();
+      } else if (changed && m.runtime === "bitgpu" && !pickedFile) {
+        // Switching models while nothing is loaded: start the new one right
+        // away rather than making the user tap Load again.
+        loadModel();
+      }
+    };
 
 modelList.append(b);
   }
@@ -367,7 +390,46 @@ function addFileControls() {
   }
 
   fileRow.append(fileButton, saveRow);
-  modelList.append(fileRow);
+
+  const clearRow = document.createElement("div");
+  clearRow.className = "model-save-row";
+  const clearLabel = document.createElement("span");
+  clearLabel.className = "model-save-label";
+  clearLabel.textContent = "Saved copies:";
+  clearRow.append(clearLabel);
+
+  for (const m of MODELS) {
+    if (m.runtime !== "bitgpu") continue;
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "model-save-link saved-clear";
+    chip.textContent = `Clear ${m.name.replace(/^Bonsai /, "").replace(/ Q1.*$/, "")}`;
+    chip.title = "Delete this model's saved weights from this device";
+    chip.onclick = async () => {
+      if (engine) {
+        errorBox.textContent =
+          "Reload or close the running model before clearing its saved copy.";
+        errorBox.hidden = false;
+        return;
+      }
+      const ok = window.confirm(
+        `Delete the saved copy of ${m.name} from this device?\n\n` +
+          `It will be downloaded again next time you load it.`
+      );
+      if (!ok) return;
+      await purgeCachedModel(m.dataUrl);
+      // It may have been the model we resume into on the next launch.
+      if (localStorage.getItem(AUTOLOAD_KEY) === m.id) {
+        localStorage.removeItem(AUTOLOAD_KEY);
+      }
+      chip.textContent = `Cleared ${m.name.replace(/^Bonsai /, "").replace(/ Q1.*$/, "")}`;
+      chip.disabled = true;
+      status.textContent = `${m.name} · saved copy deleted`;
+    };
+    clearRow.append(chip);
+  }
+
+  modelList.append(fileRow, clearRow);
 }
 
 function addBubble(role, text) {
@@ -778,11 +840,26 @@ function makeWebLLMConfig(m) {
 }
 
 async function loadModel() {
-  load.disabled = true;
-  errorBox.hidden = true;
+  const myToken = ++loadToken;
+  const alive = () => myToken === loadToken;
+  loadProgressAt = Date.now();
 
-  progressWrap.hidden = false;
-  progress.style.width = "0%";
+  load.disabled = true;
+  errorBox.hidden = true;
+
+  progressWrap.hidden = false;
+  cancelLoadButton.hidden = false;
+  progress.style.width = "0%";
+
+  // Watchdog: a stuck load (a stalled stream, a wedged runtime) must not look
+  // like progress. Nudge the user toward Cancel instead of freezing silently.
+  const stallWatch = setInterval(() => {
+    if (!alive() || busy) return;
+    if (Date.now() - loadProgressAt > 45000) {
+      progressText.textContent =
+        `No progress for 45s — this load looks stuck. Tap Cancel and pick another model.`;
+    }
+  }, 5000);
 
   const m = model();
   // Captured before the file handle is consumed by the load, so a file load is
@@ -791,20 +868,21 @@ async function loadModel() {
   localStorage.setItem("pocket-ai-last-source", wasFile ? "file" : "live");
   let h = null;
 
-  if (!isOnlineModel(m)) {
-    /*
-     * Run the complete hardware inspection before
-     * attempting to initialize a local model.
-     */
-    h = await inspect();
-    lastHW = h;
-    hardwareBox.hidden = false;
-    showHW(h);
-  } else {
-    hardwareBox.hidden = true;
-  }
+  try {
+    if (!isOnlineModel(m)) {
+      /*
+       * Run the complete hardware inspection before
+       * attempting to initialize a local model.
+       */
+      h = await inspect();
+      if (!alive()) throw ABORTED;
+      lastHW = h;
+      hardwareBox.hidden = false;
+      showHW(h);
+} else {
+      hardwareBox.hidden = true;
+    }
 
-  try {
     if (h && !h.secureContext) {
       throw Error(
         "WebGPU requires HTTPS."
@@ -856,15 +934,23 @@ async function loadModel() {
       }
     }
 
+if (!alive()) throw ABORTED;
+
     if (m.runtime === "online") {
       await loadOnlineAssist();
     } else if (m.runtime === "bitgpu") {
-      await loadBonsaiBitGPU(m);
-    } else {
-      await loadWebLLM(m);
-    }
+      await loadBonsaiBitGPU(m, alive);
+    } else {
+      await loadWebLLM(m, alive);
+    }
 
-status.textContent = isOnlineModel(m)
+    if (!alive()) throw ABORTED;
+
+    clearInterval(stallWatch);
+    cancelLoadButton.hidden = true;
+    load.disabled = false;
+
+    status.textContent = isOnlineModel(m)
       ? "Online Assist · ready"
       : `Local AI · ${m.name} · WebGPU`;
 
@@ -892,11 +978,33 @@ status.textContent = isOnlineModel(m)
     input.disabled = false;
     send.disabled = false;
 
-    input.focus();
-  } catch (e) {
-    engine = null;
-    chatEngine = null;
-    engineRuntime = null;
+input.focus();
+  } catch (e) {
+    clearInterval(stallWatch);
+
+    // A superseded load (Cancelled, model switched, or a newer load started)
+// unwinds quietly. Whoever superseded it already reset the UI, and any engine
+// this attempt built is disposed at its own assignment point (see
+// loadBonsaiBitGPU) — never here, because `engine` may already belong to the
+// newer attempt.
+if (e === ABORTED || !alive()) {
+      if (e === ABORTED) {
+        engine = null;
+        chatEngine = null;
+        engineRuntime = null;
+        kvReady = null;
+        load.disabled = false;
+        cancelLoadButton.hidden = true;
+        progressWrap.hidden = true;
+      }
+      return;
+    }
+
+    engine = null;
+    chatEngine = null;
+    engineRuntime = null;
+    kvReady = null;
+    cancelLoadButton.hidden = true;
 
     const m = model();
 
@@ -925,16 +1033,17 @@ status.textContent = isOnlineModel(m)
   }
 }
 
-async function loadWebLLM(m) {
-  engineRuntime = "webllm";
+async function loadWebLLM(m, alive = () => true) {
+  engineRuntime = "webllm";
 
-  engine = await CreateMLCEngine(
-    m.id,
-    {
-      appConfig: makeWebLLMConfig(m),
+  const created = await CreateMLCEngine(
+    m.id,
+    {
+      appConfig: makeWebLLMConfig(m),
 
-      initProgressCallback: (i) => {
-        if (i?.progress != null) {
+      initProgressCallback: (i) => {
+        loadProgressAt = Date.now();
+        if (i?.progress != null) {
           progress.style.width =
             `${Math.min(
               100,
@@ -947,10 +1056,16 @@ async function loadWebLLM(m) {
 
         progressText.textContent =
           i?.text ||
-          "Preparing local GPU runtime...";
-      },
-    }
+"Preparing local GPU runtime...";
+      },
+    }
   );
+
+  if (!alive()) {
+    try { created.unload?.(); } catch {}
+    throw ABORTED;
+  }
+  engine = created;
 }
 
 async function loadOnlineAssist() {
@@ -973,51 +1088,111 @@ const MODEL_CACHE_MAX_BYTES = 640 * 1024 * 1024;
 const META_CACHE = "pocket-ai-meta-v1";
 const META_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 
-// Serve the weights GGUF from a persistent Cache API store when available.
-// First launch: bitgpu streams the live response while the same stream is
-// stored in the background. Later launches stream straight from disk (instant,
-// works offline). The service worker ignores cross-origin fetches and never
-// deletes pocket-ai-models-*, so shell updates can't evict a multi-GB model.
-async function cachedModelStream(url) {
-  let cache = null;
+// A cache entry counts as saved only if its "done" marker exists. cache.put()
+// can be interrupted (closed tab, eviction mid-write, quota edge) and leave a
+// TRUNCATED body that still looks like a valid entry — a half-written GGUF is
+// exactly what makes the runtime stall forever or crash. The marker is written
+// last, after the body lands, so "marked" means "complete".
+const markUrl = (url) =>
+  `/__model_saved__?u=${encodeURIComponent(url)}`;
 
+const OFFLINE_WEIGHTS_MSG =
+  `You're offline and this model's weights aren't available on this device. ` +
+  `Either it was never saved here, or the saved copy is damaged — clear it in ` +
+  `the model sheet ("Saved copies:") and connect once to download it again, ` +
+  `or load the model from a saved GGUF file ("Load from a file…").`;
+
+// Verified saved copy of the weights, or null. Anything that fails validation is
+// deleted so the next online load can store a clean one.
+async function verifiedCachedModel(url) {
+  let cache = null;
+  let marked = false;
   try {
     cache = await caches.open(MODEL_CACHE);
-    if (cache) {
-      const cached = await cache.match(url);
-      if (cached && cached.ok && cached.body) {
-        const length = Number(cached.headers.get("content-length") || 0);
-        if (length > 0 && length <= MODEL_CACHE_MAX_BYTES) {
-          return cached.body;
-        }
-        cache.delete(url).catch(() => {});
-      }
+    if (!cache) return null;
+    const mark = await cache.match(markUrl(url));
+    if (!mark) return null;          // in-flight or partial write — leave it alone
+    marked = true;
+    const info = await mark.json().catch(() => null);
+    const hit = await cache.match(url);
+    if (!hit || !hit.ok || !hit.body) throw new Error("missing body");
+    const len = Number(hit.headers.get("content-length") || 0);
+    const expected = Number(info?.len || 0);
+    if (expected > 0 && len > 0 && expected !== len) {
+      throw new Error("truncated copy");
     }
+    const size = expected || len;
+    if (!(size > 0 && size <= MODEL_CACHE_MAX_BYTES)) throw new Error("bad size");
+    return hit;
   } catch {
-    cache = null;
+    if (marked && cache) {
+      // Claimed complete but isn't — drop it so it can't be used again.
+      Promise.all([cache.delete(url), cache.delete(markUrl(url))]).catch(() => {});
+    }
+    return null;
+  }
+}
+
+// Store the weights for offline use. The body is written first; the marker only
+// after the write resolves, so an interrupted store can never look complete.
+async function storeCachedModel(url, res, len) {
+  try {
+    const cache = await caches.open(MODEL_CACHE);
+    if (!cache) return;
+    await cache.put(url, res);
+    await cache.put(
+      markUrl(url),
+      new Response(JSON.stringify({ len, at: Date.now() }), {
+        headers: { "content-type": "application/json" },
+      })
+    );
+  } catch {
+    // Quota/eviction failure: leave no marker, so nothing trusts a partial body.
+  }
+}
+
+function purgeCachedModel(url) {
+  return (async () => {
+    try {
+      const cache = await caches.open(MODEL_CACHE);
+      if (!cache) return;
+      await Promise.all([cache.delete(url), cache.delete(markUrl(url))]);
+    } catch {}
+  })();
+}
+
+// Weights source. Online, the network is the source of truth: reading a few
+// hundred MB back out of the iOS Cache API is unreliable in practice (stalls,
+// and a damaged copy makes the runtime crash), so we stream from the network
+// and refresh the saved copy on the way past. Offline, the verified saved copy
+// is the only option — and if the network fails we fall back to it.
+async function cachedModelStream(url) {
+  const cached = await verifiedCachedModel(url);
+
+  if (!navigator.onLine) {
+    if (cached) return cached.body;
+    throw new Error(OFFLINE_WEIGHTS_MSG);
   }
 
-  const response = await fetch(url).catch((e) => {
-    if (!navigator.onLine) {
-      throw new Error(
-        `You're offline and this model's weights aren't saved on this device yet. ` +
-          `Connect to the internet once, or load the model from a saved GGUF file ` +
-          `(model sheet → "Load from a file…").`
-      );
-    }
+  let response;
+  try {
+    response = await fetch(url);
+  } catch (e) {
+    if (cached) return cached.body;   // flaky network — the saved copy still works
     throw e;
-  });
+  }
   if (!response.ok || !response.body) {
+    if (cached) return cached.body;
     throw new Error(`Could not fetch model data: HTTP ${response.status}`);
   }
 
-  if (cache) {
-    const length = Number(response.headers.get("content-length") || 0);
-    if (length > 0 && length <= MODEL_CACHE_MAX_BYTES) {
-      cache.put(url, response.clone()).catch(() => {});
-    } else {
-      cache.delete(url).catch(() => {});
-    }
+  const length = Number(response.headers.get("content-length") || 0);
+  if (length > 0 && length <= MODEL_CACHE_MAX_BYTES) {
+    const copy = response.clone();
+    storeCachedModel(url, copy, length).catch(() => {});
+  } else if (length > 0) {
+    // Too big to keep on device (8B/27B) — make sure no stale copy lingers.
+    purgeCachedModel(url).catch(() => {});
   }
 
   return response.body;
@@ -1175,7 +1350,7 @@ function prefetchTokenizers(m) {
   cacheFirstJson(m.tokenizerConfigUrl).catch(() => {});
 }
 
-async function loadBonsaiBitGPU(m) {
+async function loadBonsaiBitGPU(m, alive = () => true) {
   engineRuntime = "bitgpu";
 
   progressText.textContent =
@@ -1206,7 +1381,7 @@ async function loadBonsaiBitGPU(m) {
   } = await import("bitgpu/chat");
 
   try {
-    engine = await createBitGPUEngine({
+    const created = await createBitGPUEngine({
       ...(gguf
         ? {
             manifest: gguf.manifest,
@@ -1230,6 +1405,7 @@ async function loadBonsaiBitGPU(m) {
       // through every Bonsai download.)
       onProgress: (p) => {
         if (!p) return;
+        loadProgressAt = Date.now();
 
         let f = null;
         let text = null;
@@ -1264,7 +1440,16 @@ async function loadBonsaiBitGPU(m) {
         }
       },
     });
+
+    // Cancelled (or superseded) while the weights were streaming: release the
+    // GPU memory this attempt grabbed instead of parking it in the module.
+    if (!alive()) {
+      try { created.dispose?.(); } catch {}
+      throw ABORTED;
+    }
+    engine = created;
   } catch (e) {
+    if (e === ABORTED) throw e;
     if (e instanceof GpuOutOfMemoryError) {
       const cap = lastHW?.maxBuffer ? ` (this device's storage-buffer cap ≈ ${fmtGB(lastHW.maxBuffer)})` : "";
       throw new Error(
@@ -1278,7 +1463,7 @@ async function loadBonsaiBitGPU(m) {
     throw e;
   }
 
-chatEngine = await createBitGPUChat(
+  const createdChat = await createBitGPUChat(
     engine,
     {
       fetchJson: cacheFirstJson,
@@ -1290,6 +1475,13 @@ chatEngine = await createBitGPUChat(
         m.tokenizerConfigUrl,
     }
   );
+
+  if (!alive()) {
+    try { createdChat.dispose?.(); } catch {}
+    try { engine?.dispose?.(); } catch {}
+    throw ABORTED;
+  }
+  chatEngine = createdChat;
 
   // Prewarm/restore run in the background after the load reports "ready" — they
   // only prime the KV cache, so a slow (or hanging) prewarm must never stall the
@@ -1840,6 +2032,24 @@ document.body.append(fileInput);
 
 load.onclick = loadModel;
 
+// Abort whatever load is in flight and hand the UI back. Bumping loadToken makes
+// the abandoned attempt unwind (and dispose its engine) instead of leaving the
+// Load button disabled forever.
+cancelLoadButton.onclick = () => {
+  if (busy) return;   // a load can't be cancelled while an answer is generating
+  loadToken++;
+  try { engine?.dispose?.(); } catch {}
+  try { chatEngine?.dispose?.(); } catch {}
+  engine = null;
+  chatEngine = null;
+  engineRuntime = null;
+  kvReady = null;
+  load.disabled = false;
+  cancelLoadButton.hidden = true;
+  progressWrap.hidden = true;
+  status.textContent = "Cancelled · pick a model or load again";
+};
+
 $("#composer").onsubmit = (e) => {
   if (generating) {
     e.preventDefault();
@@ -1890,14 +2100,13 @@ if (reloadHint) {
   };
 }
 
-// True when the model's weights are already sitting in the on-device cache
-// (i.e. this model can boot with no network at all).
+// True when the model's weights are saved on this device AND the copy passes
+// validation (a damaged copy must not count as "installed", or the app would
+// auto-load into the same stall/crash forever).
 async function weightsCached(m) {
   if (!m || m.runtime !== "bitgpu") return false;
   try {
-    const cache = await caches.open(MODEL_CACHE);
-    const hit = await cache.match(m.dataUrl);
-    return !!(hit && hit.ok);
+    return !!(await verifiedCachedModel(m.dataUrl));
   } catch {
     return false;
   }
