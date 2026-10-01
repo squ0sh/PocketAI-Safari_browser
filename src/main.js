@@ -325,7 +325,6 @@ function renderModels() {
     b.append(a, badge);
 
 b.onclick = () => {
-      const changed = selected !== m.id;
       selected = m.id;
       localStorage.setItem(KEY, selected);
 
@@ -333,18 +332,13 @@ b.onclick = () => {
       sheet.classList.remove("open");
       updateWelcome();
 
+      // Picking a model never starts a download by itself. If a load is already
+      // running, cancel it so it can't hold the GPU or the progress bar; the
+      // user taps Load when they're ready.
       if (engine) {
         location.reload();
       } else if (load.disabled) {
-        // A load is in flight (possibly stuck). Cancel it, then start the model
-        // the user just picked — choosing a different model must never be a
-        // dead end.
         cancelLoadButton.click();
-        loadModel();
-      } else if (changed && m.runtime === "bitgpu" && !pickedFile) {
-        // Switching models while nothing is loaded: start the new one right
-        // away rather than making the user tap Load again.
-        loadModel();
       }
     };
 
@@ -2086,49 +2080,15 @@ if (reloadHint) {
   };
 }
 
-// True when the model's weights are saved on this device AND the copy passes
-// validation (a damaged copy must not count as "installed", or the app would
-// auto-load into the same stall/crash forever).
-async function weightsCached(m) {
-  if (!m || m.runtime !== "bitgpu") return false;
-  try {
-    return !!(await verifiedCachedModel(m.dataUrl));
-  } catch {
-    return false;
-  }
-}
-
-// Resume policy: the app never downloads anything on open, and it never changes
-// the chosen model. It auto-loads the model you selected ONLY if its weights are
-// already saved on this device (a pure disk read — fine online or offline);
-// anything else waits for you to tap Load. So a first launch just shows the
-// chooser, and no surprise 300 MB+ stream ever starts behind your back.
-// Skipped: a last-session file load (a File handle can't outlive a reload —
-// shows the "reload from a saved file" hint instead) and the 27B (~3.8 GB).
-const lastSource = localStorage.getItem("pocket-ai-last-source") || "live";
-const bootModel = model();
-if (bootModel.runtime === "bitgpu" && lastSource !== "live" && !engine) {
-  if (reloadHint) reloadHint.hidden = false;
-} else if (
-  bootModel.runtime !== "online" &&
-  bootModel.id !== "Bonsai-27B-bitgpu" &&
-  !engine
+// No auto-load. Nothing starts loading on open, ever: the user picks a model
+// (or reloads a saved file) and taps Load. The one exception is a hint — if the
+// last session ran from a picked .gguf, that File handle can't outlive a reload,
+// so offer a button to re-pick it.
+if (
+  model().runtime === "bitgpu" &&
+  localStorage.getItem("pocket-ai-last-source") === "file" &&
+  !engine &&
+  reloadHint
 ) {
-  (async () => {
-    // Only ever the selected model. Swapping in a different one here would
-    // silently override the user's choice.
-    if (bootModel.runtime === "bitgpu" && (await weightsCached(bootModel))) {
-      loadModel();
-      return;
-    }
-    if (!navigator.onLine) {
-      status.textContent = "Offline";
-      progressText.textContent =
-        `You're offline and ${bootModel.name} isn't saved on this device yet. ` +
-        `Pick a model you have saved (1.7B / 4B), or load a saved .gguf file.`;
-      progressWrap.hidden = false;
-    } else {
-      status.textContent = "Ready · choose a model to load";
-    }
-  })();
+  reloadHint.hidden = false;
 }
