@@ -12,7 +12,12 @@ self.addEventListener("activate", (event) =>
       .then((keys) =>
         Promise.all(
           keys
-            .filter((key) => key !== CACHE && !key.startsWith("pocket-ai-models-"))
+            .filter(
+              (key) =>
+                key !== CACHE &&
+                !key.startsWith("pocket-ai-models-") &&
+                !key.startsWith("pocket-ai-meta-")
+            )
             .map((key) => caches.delete(key))
         )
       )

@@ -29,8 +29,9 @@ for 1-bit Bonsai models — with MLC/WebLLM as the baseline runtime and an optio
 
 Every Bonsai row exposes a **"Save to Files"** chip (Safari's resumable download) and a
 **"Load from a file…"** picker, so any model can run straight from a local `.gguf` —
-no re-downloading, no web-storage quota involved. 1.7B and 4B also load offline from the
-on-device weight cache once they've loaded online; 8B and 27B use the file while offline.
+no re-downloading, no web-storage quota involved, and it works with no connection at all.
+That's the offline route for every model: **the app deliberately caches no weights** (see
+[Why weights are never cached](#why-weights-are-never-cached)).
 
 Qwen3 1.7B is intentionally omitted from this build while Bonsai bitgpu testing continues.
 
@@ -110,19 +111,42 @@ Remote by design — don't use it for messages you want to keep entirely on-devi
 
 ## Important
 
-WebLLM weights persist in IndexedDB. Bonsai **1.7B and 4B weights** cache through the Cache API
-(store capped at 640 MB — iOS Safari crashes its page process on larger `cache.put` bodies and its
-Cache quota is ~1 GB, so **8B / 27B** stream from the network each launch). Every Bonsai model's
-small support files — manifest, aux, and the tokenizer — are cached too, so **any model that has
-ever loaded online boots again in airplane mode**: 1.7B/4B straight from the cached weights, and
-**8B/27B from a saved GGUF file** ("Load from a file…", which never touches the cache — the tokenizer
-the file-load needs is served from its cached copy). A one-shot `navigator.storage.persist()`
-reduces eviction odds, and the service worker ignores cross-origin fetches and never
-deletes `pocket-ai-models-*`, so shell updates can't wipe a multi-GB model.
+WebLLM weights persist in IndexedDB. **Bonsai weights are never cached by the app** — they stream
+straight to the GPU (see [Why weights are never cached](#why-weights-are-never-cached)). Every Bonsai
+model's small support files — manifest, aux, and the tokenizer — *are* cached, so **"Load from a
+file…" works in airplane mode**: the file supplies the weights and the cached copies supply everything
+else. A one-shot `navigator.storage.persist()` reduces eviction odds, and the service worker ignores
+cross-origin fetches and never deletes `pocket-ai-meta-*`, so a shell update can't wipe them.
 
 Switching models after one is loaded reloads the PWA so the WebGPU runtime is cleanly
 recreated — except after "Load from a file…", where the picked file can't outlive a
 reload, so that path disposes the old engine and starts the new one in-session instead.
+
+## Why weights are never cached
+
+The short version: **caching the weights in the Cache API was itself the bug.** 4B kept
+crashing the tab while 8B — the *bigger* model — loaded fine every time, which ruled out
+GPU memory and pointed at the one thing the two didn't share.
+
+| Model | GGUF | Under the old 640 MB cap? | Result |
+| --- | --- | --- | --- |
+| 1.7B | 237 MiB | yes → `cache.put()` | stalled, then locked the UI |
+| **4B** | **546 MiB** | **yes → `cache.put()`** | **tab killed** |
+| 8B | 1105 MiB | no → streamed | worked, every time |
+
+The old build capped `pocket-ai-models-v1` at 640 MB, so 1.7B and 4B were written into the
+Cache API and 8B was not. iOS Safari materializes a `cache.put()` body **inside the tab's
+page process**, so the only two models that ever ran that code path were the only two that
+failed — and the failure scaled with body size: 237 MiB was survivable, 546 MiB was not. The
+`"done"` marker, the truncation checks, and the per-model "Clear saved copy" chips all tried to
+make that write *safe*; none of them could make it *small*.
+
+So the write is gone. Weights go network → GPU with nothing in between, which is the same
+path 8B always took. Offline is the file's job: **Save to Files** puts the GGUF on the device
+via Safari's resumable download, and **Load from a file…** streams it from there. Only the
+small support files (manifest, aux, tokenizer — KB, not MB) stay in the Cache API, which is
+what makes that offline file-load complete. One-shot cleanup deletes any `pocket-ai-models-*`
+cache left by an older build.
 
 Chats are **durable on-device**: transcripts mirror into IndexedDB as you chat, so closing or
 reloading the tab never loses them (and the app reopens ready to go). Context windows are
@@ -135,20 +159,19 @@ and no index or transcript leaves the device.
 
 ### v0.6.0
 
-- **Bonsai weights cached on device — 1.7B (~290 MB) and 4B (~570 MB)** via a Cache API-backed `fetchStream`: first launch downloads once, and the copy is what airplane mode boots from (and the fallback when the network drops). Online launches stream fresh from the network and refresh the copy. 8B/27B out-grow iOS's ~1 GB Cache quota, so they're never cached (or load from a saved file). The manifest, aux, and tokenizer files cache too, so whatever has loaded online once also boots in airplane mode.
+- **Weights are never cached in-page.** On iOS Safari, `cache.put()` materializes the response body inside the tab's page process — a 546 MB GGUF (4B) was exactly enough to crash the tab and a 237 MB GGUF (1.7B) to wedge it. 8B, which had never fit that cap, loaded fine from the start. So Bonsai weights stream directly to the GPU — always online, never to the Cache API. The small support files (manifest/aux/tokenizer) still cache so **"Load from a file…" works fully offline**. The manifest, aux, and tokenizer files cache too, so a file-based load has everything it needs in airplane mode.
 - **"Load from a file…" for every Bonsai model.** Pick a saved `Bonsai-*.gguf` from Files; the app parses the GGUF header in place (`fromGgufBytes`) and streams weights straight from the file. Per-model **"Save to Files"** chips hand Safari a resumable background download. No re-downloads, no quota games.
 - **Honest 27B ceiling.** A heavyweight file-load shows a heads-up about the ~3.8 GB GPU footprint and the device's storage-buffer cap before it starts; caught OOM errors name the cap too. On a phone, Safari can still JetSam the tab silently — that's the device, not the app.
 - **PWA iPhones finally recognize.** The manifest + icon lived at the repo root instead of `public/`, so iOS was handed an HTML page as its manifest and home-screen icon. Now `/manifest.webmanifest`, `/icon.svg`, and PNG icons (180/192/512) actually ship, with `apple-touch-icon`, `apple-mobile-web-app-capable`, and a `black-translucent` status bar.
-- **Service worker plays nice with the model cache** — ignores cross-origin fetches, never deletes `pocket-ai-models-*`.
+- **Service worker plays nice with the model cache** — ignores cross-origin fetches and never deletes `pocket-ai-meta-*`.
 - **`npm run check` guards the PWA wiring** (manifest parses as JSON, icons serve as images).
 - **Token-accurate context.** Local chats are measured with bitgpu's real tokenizer and trimmed to the model's window — the system prompt stays pinned, newest turns survive, and max-token budgets no longer silently eat your context.
 - **Higher-quality local defaults** — dedicated sampling presets (`temperature` 0.7, `topP` 0.9, `topK` 40) per Bonsai model instead of one shared guess.
 - **Durable, instantly-resumable chats.** Transcripts persist in IndexedDB across tab close/reload. For local chats that fit ~64 MB of KV cache, a snapshot of the prewarmed context is saved after each turn (and on exit), so the next open restores the conversation at speed. Chats stay purely on-device.
 - **Loads that can be interrupted.** Every load carries a **Cancel** button, a 45-second stall warning, and a load token: picking a different model cancels the one in flight (disposing its GPU memory) and starts the new one immediately — a stuck load can never lock you out of the app.
 - **Nothing loads until you say so.** There is no auto-load at all: opening the app never downloads or starts a model, never picks a model for you, and never silently swaps you to a different one. You choose the model and tap **Load Local AI**. (The only automatic action is a hint button after a file-based session, since a picked `.gguf` can't survive a reload.)
-- **A saved copy is only trusted when it's provably whole.** The weights get a "done" marker written *after* the body lands, so an interrupted/evicted `cache.put()` can never masquerade as a usable model (a truncated GGUF is what used to stall a load forever or crash it). Damaged copies are deleted automatically. Online loads stream from the network and refresh the saved copy — reading a few hundred MB back out of iOS's Cache API proved unreliable — so the saved copy is what airplane mode uses, plus a fallback when the network hiccups.
-- **"Clear saved copy" per model** (model sheet, under "Saved copies:") — drop one model's stored weights without reinstalling the app.
-- **"Update site" button** (drawer footer) — pulls the newest build without deleting the app from the Home Screen: unregisters the service worker, drops the shell cache, reloads. **Your model weights, cached support files, and chats all stay put**, so updating never costs a re-download.
+- **"Update site" button** (drawer footer) — pulls the newest build without deleting the app from the Home Screen: unregisters the service worker, drops the shell cache, reloads. **Your cached metadata files and chats stay put**, so updating never costs a re-download. (Weights are never cached, so streaming models don't re-download unless you switch them.)
+
 
 ### v0.5.1 — Housekeeping
 

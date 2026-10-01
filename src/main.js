@@ -381,41 +381,7 @@ function addFileControls() {
 
   fileRow.append(fileButton, saveRow);
 
-  const clearRow = document.createElement("div");
-  clearRow.className = "model-save-row";
-  const clearLabel = document.createElement("span");
-  clearLabel.className = "model-save-label";
-  clearLabel.textContent = "Saved copies:";
-  clearRow.append(clearLabel);
-
-  for (const m of MODELS) {
-    if (m.runtime !== "bitgpu") continue;
-    const chip = document.createElement("button");
-    chip.type = "button";
-    chip.className = "model-save-link saved-clear";
-    chip.textContent = `Clear ${m.name.replace(/^Bonsai /, "").replace(/ Q1.*$/, "")}`;
-    chip.title = "Delete this model's saved weights from this device";
-    chip.onclick = async () => {
-      if (engine) {
-        errorBox.textContent =
-          "Reload or close the running model before clearing its saved copy.";
-        errorBox.hidden = false;
-        return;
-      }
-      const ok = window.confirm(
-        `Delete the saved copy of ${m.name} from this device?\n\n` +
-          `It will be downloaded again next time you load it.`
-      );
-      if (!ok) return;
-      await purgeCachedModel(m.dataUrl);
-      chip.textContent = `Cleared ${m.name.replace(/^Bonsai /, "").replace(/ Q1.*$/, "")}`;
-      chip.disabled = true;
-      status.textContent = `${m.name} · saved copy deleted`;
-    };
-    clearRow.append(chip);
-  }
-
-  modelList.append(fileRow, clearRow);
+  modelList.append(fileRow);
 }
 
 function addBubble(role, text) {
@@ -1054,129 +1020,40 @@ async function loadOnlineAssist() {
   progress.style.width = "100%";
 }
 
-const MODEL_CACHE = "pocket-ai-models-v1";
-// iOS Safari crashes its tab process when page-side cache.put() materializes a
-// body beyond ~1.5GB (Jetsam), and its Cache API quota is ~1GB. 1.7B (~290MB)
-// and 4B (~570MB) fit inside both; 8B (~1.16GB) and 27B (~3.8GB) blow through
-// the quota, so those stream from the network each launch (or load from a saved
-// GGUF file — the file path never touches the cache).
-const MODEL_CACHE_MAX_BYTES = 640 * 1024 * 1024;
-
-// Small metadata (manifest.json, *.aux.bin, tokenizer.json/config): cached so
-// the app boots a model fully offline once it has ever loaded online. Network-
-// first so updates flow through; the cache fallback covers airplane mode.
-const META_CACHE = "pocket-ai-meta-v1";
-const META_CACHE_MAX_BYTES = 16 * 1024 * 1024;
-
-// A cache entry counts as saved only if its "done" marker exists. cache.put()
-// can be interrupted (closed tab, eviction mid-write, quota edge) and leave a
-// TRUNCATED body that still looks like a valid entry — a half-written GGUF is
-// exactly what makes the runtime stall forever or crash. The marker is written
-// last, after the body lands, so "marked" means "complete".
-const markUrl = (url) =>
-  `/__model_saved__?u=${encodeURIComponent(url)}`;
-
+// Weights are NEVER cached by the app. iOS Safari materializes a cache.put()
+// body inside the tab's page process, so storing a multi-hundred-MB GGUF there
+// is exactly what crashes (4B, 546 MiB) or wedges (1.7B, 237 MiB) the tab — while
+// 8B, which was never small enough to cache, loaded fine every time. The body
+// streams straight to the GPU instead. Offline, load from a saved GGUF file:
+// the "Save to Files" chips in the model sheet put the file on the device, and
+// that path never touches the Cache API.
 const OFFLINE_WEIGHTS_MSG =
-  `You're offline and this model's weights aren't available on this device. ` +
-  `Either it was never saved here, or the saved copy is damaged — clear it in ` +
-  `the model sheet ("Saved copies:") and connect once to download it again, ` +
-  `or load the model from a saved GGUF file ("Load from a file…").`;
+  `You're offline, so the model weights can't be downloaded. ` +
+  `Save the model to Files once (model sheet → "Save to Files"), then load it ` +
+  `with "Load from a file…" — that works with no connection at all.`;
 
-// Verified saved copy of the weights, or null. Anything that fails validation is
-// deleted so the next online load can store a clean one.
-async function verifiedCachedModel(url) {
-  let cache = null;
-  let marked = false;
-  try {
-    cache = await caches.open(MODEL_CACHE);
-    if (!cache) return null;
-    const mark = await cache.match(markUrl(url));
-    if (!mark) return null;          // in-flight or partial write — leave it alone
-    marked = true;
-    const info = await mark.json().catch(() => null);
-    const hit = await cache.match(url);
-    if (!hit || !hit.ok || !hit.body) throw new Error("missing body");
-    const len = Number(hit.headers.get("content-length") || 0);
-    const expected = Number(info?.len || 0);
-    if (expected > 0 && len > 0 && expected !== len) {
-      throw new Error("truncated copy");
-    }
-    const size = expected || len;
-    if (!(size > 0 && size <= MODEL_CACHE_MAX_BYTES)) throw new Error("bad size");
-    return hit;
-  } catch {
-    if (marked && cache) {
-      // Claimed complete but isn't — drop it so it can't be used again.
-      Promise.all([cache.delete(url), cache.delete(markUrl(url))]).catch(() => {});
-    }
-    return null;
-  }
-}
-
-// Store the weights for offline use. The body is written first; the marker only
-// after the write resolves, so an interrupted store can never look complete.
-async function storeCachedModel(url, res, len) {
-  try {
-    const cache = await caches.open(MODEL_CACHE);
-    if (!cache) return;
-    await cache.put(url, res);
-    await cache.put(
-      markUrl(url),
-      new Response(JSON.stringify({ len, at: Date.now() }), {
-        headers: { "content-type": "application/json" },
-      })
-    );
-  } catch {
-    // Quota/eviction failure: leave no marker, so nothing trusts a partial body.
-  }
-}
-
-function purgeCachedModel(url) {
-  return (async () => {
-    try {
-      const cache = await caches.open(MODEL_CACHE);
-      if (!cache) return;
-      await Promise.all([cache.delete(url), cache.delete(markUrl(url))]);
-    } catch {}
-  })();
-}
-
-// Weights source. Online, the network is the source of truth: reading a few
-// hundred MB back out of the iOS Cache API is unreliable in practice (stalls,
-// and a damaged copy makes the runtime crash), so we stream from the network
-// and refresh the saved copy on the way past. Offline, the verified saved copy
-// is the only option — and if the network fails we fall back to it.
 async function cachedModelStream(url) {
-  const cached = await verifiedCachedModel(url);
-
-  if (!navigator.onLine) {
-    if (cached) return cached.body;
-    throw new Error(OFFLINE_WEIGHTS_MSG);
-  }
-
   let response;
   try {
     response = await fetch(url);
   } catch (e) {
-    if (cached) return cached.body;   // flaky network — the saved copy still works
+    if (!navigator.onLine) throw new Error(OFFLINE_WEIGHTS_MSG);
     throw e;
   }
   if (!response.ok || !response.body) {
-    if (cached) return cached.body;
+    if (!navigator.onLine) throw new Error(OFFLINE_WEIGHTS_MSG);
     throw new Error(`Could not fetch model data: HTTP ${response.status}`);
   }
-
-  const length = Number(response.headers.get("content-length") || 0);
-  if (length > 0 && length <= MODEL_CACHE_MAX_BYTES) {
-    const copy = response.clone();
-    storeCachedModel(url, copy, length).catch(() => {});
-  } else if (length > 0) {
-    // Too big to keep on device (8B/27B) — make sure no stale copy lingers.
-    purgeCachedModel(url).catch(() => {});
-  }
-
   return response.body;
 }
+
+// Small metadata (manifest.json, *.aux.bin, tokenizer.json/config): a few KB to
+// a couple of MB at most, so these ARE cached — they're what makes an offline
+// file-load work (the file supplies the weights, the cache supplies everything
+// else). Network-first so updates flow through; the cache fallback covers
+// airplane mode.
+const META_CACHE = "pocket-ai-meta-v1";
+const META_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 
 // Network-first fetch with a Cache API fallback, shared by manifest/aux/tokenizer.
 // Online: fetch and store (tiny files) so the app works offline later. Offline:
@@ -1945,9 +1822,9 @@ function onFilePicked(file) {
 // "Update site" — pull the newest build without deleting the app from the Home
 // Screen. Only the shell is wiped: the service worker is unregistered and
 // pocket-ai-shell-* caches dropped, so the reload bypasses the old cached
-// bundle. The model weights (pocket-ai-models-*) and support files
-// (pocket-ai-meta-*) stay — an update must not cost a re-download — and chats
-// live in IndexedDB/localStorage, so nothing is lost.
+// bundle. The support files (pocket-ai-meta-*) and chats (IndexedDB/
+// localStorage) stay, so an update never costs a re-download of anything small.
+// Model weights aren't cached by the app at all any more — see cachedModelStream.
 async function updateSite() {
   const btn = $("#updateButton");
   if (busy) {
@@ -1962,7 +1839,8 @@ async function updateSite() {
   }
   const ok = window.confirm(
     "Clear the app's cached copy and reload the newest version?\n\n" +
-      "Your chats and any models saved on this device are kept."
+      "Your chats are kept. Model weights are no longer cached by the app, " +
+      "so nothing has to be re-downloaded except a model you were using."
   );
   if (!ok) return;
 
@@ -2056,8 +1934,27 @@ if ("serviceWorker" in navigator) {
     .catch(console.warn);
 }
 
-// Reduce the odds of the browser evicting the model weight cache under
-// storage pressure. Best-effort; iOS grants this without a user prompt.
+// Older versions cached model weights in the Cache API, which is what made 4B
+// crash and 1.7B wedge — iOS materializes that body inside the tab's page
+// process. Those copies are dead weight now, and they eat into the ~1GB Cache
+// API quota, so drop them once. Chats, KV snapshots and the metadata cache are
+// untouched.
+if (localStorage.getItem("pocket-ai-models-purged") !== "1") {
+  caches
+    .keys()
+    .then((keys) =>
+      Promise.all(
+        keys
+          .filter((key) => key.startsWith("pocket-ai-models-"))
+          .map((key) => caches.delete(key))
+      )
+    )
+    .then(() => localStorage.setItem("pocket-ai-models-purged", "1"))
+    .catch(() => {});
+}
+
+// Reduce the odds of the browser evicting the metadata cache under storage
+// pressure. Best-effort; iOS grants this without a user prompt.
 if (navigator.storage?.persist) {
   navigator.storage.persist().catch(() => {});
 }
