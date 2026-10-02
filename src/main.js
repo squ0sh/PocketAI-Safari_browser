@@ -1,6 +1,13 @@
 import { CreateMLCEngine, prebuiltAppConfig } from "@mlc-ai/web-llm";
 import "./style.css";
 
+// Bundled at /tokenizer/* and precached by the service worker, so loading from a
+// local file needs no network at all. Qwen2Tokenizer, byte-identical across the
+// 1.7B/4B/8B checkpoints (md5 415df598feeb7a2dc86e8d009284dc94). The 27B hybrid
+// is qwen3_5 with a 248k vocab, so it keeps its own remote tokenizer.
+const TOKENIZER_JSON = "/tokenizer/tokenizer.json";
+const TOKENIZER_CONFIG = "/tokenizer/tokenizer_config.json";
+
 const MODELS = [
   {
     id: "Qwen2.5-0.5B-Instruct-q4f16_1-MLC",
@@ -22,10 +29,8 @@ const MODELS = [
       "https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.19.1/models/bonsai-1.7b-gguf/Bonsai-1.7B-Q1_0.aux.bin",
     dataUrl:
       "https://huggingface.co/prism-ml/Bonsai-1.7B-gguf/resolve/main/Bonsai-1.7B-Q1_0.gguf",
-    tokenizerJsonUrl:
-      "https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX/resolve/main/tokenizer.json",
-    tokenizerConfigUrl:
-      "https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX/resolve/main/tokenizer_config.json",
+    tokenizerJsonUrl: TOKENIZER_JSON,
+    tokenizerConfigUrl: TOKENIZER_CONFIG,
 maxSeqLen: 4096,
     kvCache: "q8",
     kvBytesPerToken: 31 * 1024,
@@ -43,10 +48,8 @@ maxSeqLen: 4096,
       "https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.19.1/models/bonsai-4b-gguf/Bonsai-4B-Q1_0.aux.bin",
     dataUrl:
       "https://huggingface.co/prism-ml/Bonsai-4B-gguf/resolve/main/Bonsai-4B-Q1_0.gguf",
-    tokenizerJsonUrl:
-      "https://huggingface.co/onnx-community/Bonsai-4B-ONNX/resolve/main/tokenizer.json",
-    tokenizerConfigUrl:
-      "https://huggingface.co/onnx-community/Bonsai-4B-ONNX/resolve/main/tokenizer_config.json",
+    tokenizerJsonUrl: TOKENIZER_JSON,
+    tokenizerConfigUrl: TOKENIZER_CONFIG,
 maxSeqLen: 4096,
     kvCache: "q8",
     kvBytesPerToken: 79 * 1024,
@@ -64,10 +67,8 @@ maxSeqLen: 4096,
       "https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.19.1/models/bonsai-8b-gguf/Bonsai-8B-Q1_0.aux.bin",
     dataUrl:
       "https://huggingface.co/prism-ml/Bonsai-8B-gguf/resolve/main/Bonsai-8B-Q1_0.gguf",
-    tokenizerJsonUrl:
-      "https://huggingface.co/onnx-community/Bonsai-8B-ONNX/resolve/main/tokenizer.json",
-    tokenizerConfigUrl:
-      "https://huggingface.co/onnx-community/Bonsai-8B-ONNX/resolve/main/tokenizer_config.json",
+    tokenizerJsonUrl: TOKENIZER_JSON,
+    tokenizerConfigUrl: TOKENIZER_CONFIG,
 maxSeqLen: 8192,
     kvCache: "q8",
     kvBytesPerToken: 88 * 1024,
@@ -1055,9 +1056,11 @@ async function cachedModelStream(url) {
 const META_CACHE = "pocket-ai-meta-v1";
 const META_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 
-// Network-first fetch with a Cache API fallback, shared by manifest/aux/tokenizer.
-// Online: fetch and store (tiny files) so the app works offline later. Offline:
-// serve the stored copy. Never stores anything big.
+// Cache-first fetch with a network fallback, shared by manifest/aux/tokenizer.
+// Cache-first is deliberate: once stored, these reads skip the network entirely.
+// The bundled tokenizer is same-origin and precached by the service worker, so it
+// normally never reaches this function; manifest/aux are small and only needed on
+// the network download path. Never stores anything big.
 async function metaFetch(url) {
   let cache = null;
   try {
@@ -1082,7 +1085,11 @@ async function metaFetch(url) {
   if (cache) {
     const len = Number(res.headers.get("content-length") || 0);
     if (len > 0 && len <= META_CACHE_MAX_BYTES) {
-      cache.put(url, res.clone()).catch(() => {});
+      // Logged rather than swallowed: a silently dropped write used to leave an
+      // empty cache with no way to tell offline loads had quietly stopped working.
+      cache.put(url, res.clone()).catch((e) => {
+        console.warn(`[meta] failed to cache ${url}`, e);
+      });
     }
   }
   return res;
@@ -1202,9 +1209,16 @@ async function tryRestoreKv(chatId) {
 // Pre-cache the tokenizer files as soon as a load starts, so even a model whose
 // load dies mid-stream (27B Jetsam on a phone) still leaves its tokenizer behind
 // for a later offline file-load. Never blocks the load itself.
+//
+// Skipped for the bundled tokenizer: the service worker precaches that one, and
+// parsing 8.7 MB of JSON here would cost real time on a phone for no gain.
 function prefetchTokenizers(m) {
-  cacheFirstJson(m.tokenizerJsonUrl).catch(() => {});
-  cacheFirstJson(m.tokenizerConfigUrl).catch(() => {});
+  for (const url of [m.tokenizerJsonUrl, m.tokenizerConfigUrl]) {
+    if (typeof url === "string" && url.startsWith("/")) continue;
+    cacheFirstJson(url).catch((e) => {
+      console.warn(`[meta] tokenizer prefetch failed for ${url}`, e);
+    });
+  }
 }
 
 async function loadBonsaiBitGPU(m, alive = () => true) {

@@ -112,11 +112,13 @@ Remote by design — don't use it for messages you want to keep entirely on-devi
 ## Important
 
 WebLLM weights persist in IndexedDB. **Bonsai weights are never cached by the app** — they stream
-straight to the GPU (see [Why weights are never cached](#why-weights-are-never-cached)). Every Bonsai
-model's small support files — manifest, aux, and the tokenizer — *are* cached, so **"Load from a
-file…" works in airplane mode**: the file supplies the weights and the cached copies supply everything
-else. A one-shot `navigator.storage.persist()` reduces eviction odds, and the service worker ignores
-cross-origin fetches and never deletes `pocket-ai-meta-*`, so a shell update can't wipe them.
+straight to the GPU (see [Why weights are never cached](#why-weights-are-never-cached)). A file-based
+load needs nothing else from the network: the tokenizer ships **with the app** at `/tokenizer/` and is
+precached by the service worker, while the manifest and aux are parsed straight out of the GGUF you
+picked. So **"Load from a file…" works in airplane mode** by construction. Manifest and aux still use
+the Cache API for the download path, a one-shot `navigator.storage.persist()` reduces eviction odds,
+and the service worker ignores cross-origin fetches and never deletes `pocket-ai-meta-*`, so a shell
+update can't wipe what it holds.
 
 Switching models after one is loaded reloads the PWA so the WebGPU runtime is cleanly
 recreated — except after "Load from a file…", where the picked file can't outlive a
@@ -143,10 +145,26 @@ make that write *safe*; none of them could make it *small*.
 
 So the write is gone. Weights go network → GPU with nothing in between, which is the same
 path 8B always took. Offline is the file's job: **Save to Files** puts the GGUF on the device
-via Safari's resumable download, and **Load from a file…** streams it from there. Only the
-small support files (manifest, aux, tokenizer — KB, not MB) stay in the Cache API, which is
-what makes that offline file-load complete. One-shot cleanup deletes any `pocket-ai-models-*`
-cache left by an older build.
+via Safari's resumable download, and **Load from a file…** streams it from there. One-shot
+cleanup deletes any `pocket-ai-models-*` cache left by an older build.
+
+### The tokenizer is bundled, not cached
+
+Offline file-loads originally leaned on the Cache API for the tokenizer too, and that
+failed in practice: the write was fire-and-forget with its error swallowed
+(`.catch(() => {})`) and its result never verified, so a dropped or evicted 8.7 MB copy
+left a cache that *looked* healthy while every airplane-mode load died with no useful clue.
+
+So it no longer depends on the Cache API at all. 1.7B, 4B and 8B share one byte-identical
+`Qwen2Tokenizer` (md5 `415df598feeb7a2dc86e8d009284dc94`, 8.7 MB raw / ~1.9 MB gzipped),
+shipped once at `public/tokenizer/` and precached by the service worker — same-origin, so
+it's the one storage path we fully control. **27B is excluded on purpose**: it's a
+`qwen3_5` hybrid with a 248k vocab rather than 151k, so it keeps its own remote tokenizer.
+
+The service worker also no longer uses `cache.addAll()` for precaching. That call rejects as
+a unit, which meant a single unreachable URL could abandon the entire install and leave the
+app with no service worker at all. Each entry is now added independently: a missing tokenizer
+degrades to no offline tokenizer, but a missing app shell still correctly fails the install.
 
 Chats are **durable on-device**: transcripts mirror into IndexedDB as you chat, so closing or
 reloading the tab never loses them (and the app reopens ready to go). Context windows are
@@ -159,7 +177,9 @@ and no index or transcript leaves the device.
 
 ### v0.6.0
 
-- **Weights are never cached in-page.** On iOS Safari, `cache.put()` materializes the response body inside the tab's page process — a 546 MB GGUF (4B) was exactly enough to crash the tab and a 237 MB GGUF (1.7B) to wedge it. 8B, which had never fit that cap, loaded fine from the start. So Bonsai weights stream directly to the GPU — always online, never to the Cache API. The small support files (manifest/aux/tokenizer) still cache so **"Load from a file…" works fully offline**. The manifest, aux, and tokenizer files cache too, so a file-based load has everything it needs in airplane mode.
+- **Weights are never cached in-page.** On iOS Safari, `cache.put()` materializes the response body inside the tab's page process — a 546 MB GGUF (4B) was exactly enough to crash the tab and a 237 MB GGUF (1.7B) to wedge it. 8B, which had never fit that cap, loaded fine from the start. So Bonsai weights stream directly to the GPU — always online, never to the Cache API. Manifest and aux still cache for the download path, so **"Load from a file…" works fully offline**.
+- **Offline file-load no longer depends on a cache write succeeding.** The shared 1.7B/4B/8B `Qwen2Tokenizer` now ships with the app at `/tokenizer/` and is precached same-origin by the service worker, instead of being written to the Cache API by a fire-and-forget `cache.put()` whose failure was silently swallowed. Manifest and aux are parsed out of the picked GGUF, so an airplane-mode file-load needs no network and no cache. The 27B hybrid keeps its own remote tokenizer — different vocab. Service-worker precaching also stopped using all-or-nothing `cache.addAll()`, which could abandon the whole install over one unreachable URL.
+- **Cache failures are visible.** `metaFetch` and the tokenizer prefetch log their rejections instead of discarding them, so a storage problem shows up in the console rather than as a mysteriously broken offline load.
 - **"Load from a file…" for every Bonsai model.** Pick a saved `Bonsai-*.gguf` from Files; the app parses the GGUF header in place (`fromGgufBytes`) and streams weights straight from the file. Per-model **"Save to Files"** chips hand Safari a resumable background download. No re-downloads, no quota games.
 - **Honest 27B ceiling.** A heavyweight file-load shows a heads-up about the ~3.8 GB GPU footprint and the device's storage-buffer cap before it starts; caught OOM errors name the cap too. On a phone, Safari can still JetSam the tab silently — that's the device, not the app.
 - **PWA iPhones finally recognize.** The manifest + icon lived at the repo root instead of `public/`, so iOS was handed an HTML page as its manifest and home-screen icon. Now `/manifest.webmanifest`, `/icon.svg`, and PNG icons (180/192/512) actually ship, with `apple-touch-icon`, `apple-mobile-web-app-capable`, and a `black-translucent` status bar.
@@ -170,7 +190,7 @@ and no index or transcript leaves the device.
 - **Durable, instantly-resumable chats.** Transcripts persist in IndexedDB across tab close/reload. For local chats that fit ~64 MB of KV cache, a snapshot of the prewarmed context is saved after each turn (and on exit), so the next open restores the conversation at speed. Chats stay purely on-device.
 - **Loads that can be interrupted.** Every load carries a **Cancel** button, a 45-second stall warning, and a load token: picking a different model cancels the one in flight (disposing its GPU memory) and starts the new one immediately — a stuck load can never lock you out of the app.
 - **Nothing loads until you say so.** There is no auto-load at all: opening the app never downloads or starts a model, never picks a model for you, and never silently swaps you to a different one. You choose the model and tap **Load Local AI**. (The only automatic action is a hint button after a file-based session, since a picked `.gguf` can't survive a reload.)
-- **"Update site" button** (drawer footer) — pulls the newest build without deleting the app from the Home Screen: unregisters the service worker, drops the shell cache, reloads. **Your cached metadata files and chats stay put**, so updating never costs a re-download. (Weights are never cached, so streaming models don't re-download unless you switch them.)
+- **"Update site" button** (drawer footer) — pulls the newest build without deleting the app from the Home Screen: unregisters the service worker, drops the shell cache, reloads. **Your chats, KV snapshots and cached metadata stay put**, so updating never costs a re-download. (Weights are never cached, so streaming models don't re-download unless you switch them. The bundled tokenizer is re-precached automatically on the reload.)
 
 
 ### v0.5.1 — Housekeeping
