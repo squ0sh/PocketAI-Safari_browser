@@ -1,10 +1,11 @@
-import { CreateMLCEngine, prebuiltAppConfig } from "@mlc-ai/web-llm";
 import "./style.css";
+import { SYSTEM_PROMPT, preparePrompt } from "./context.js";
+import { offlineStatus, updateOfflineApp } from "./offline.js";
 
 // Bundled at /tokenizer/* and precached by the service worker, so loading from a
 // local file needs no network at all. Qwen2Tokenizer, byte-identical across the
 // 1.7B/4B/8B checkpoints (md5 415df598feeb7a2dc86e8d009284dc94). The 27B hybrid
-// is qwen3_5 with a 248k vocab, so it keeps its own remote tokenizer.
+// is qwen3_5 with a 248k vocab, so it has a separate bundled tokenizer.
 const TOKENIZER_JSON = "/tokenizer/tokenizer.json";
 const TOKENIZER_CONFIG = "/tokenizer/tokenizer_config.json";
 
@@ -21,7 +22,7 @@ const MODELS = [
     id: "Bonsai-1.7B-bitgpu",
     name: "Bonsai 1.7B Q1",
     tier: "1-bit",
-    description: "Browser-native 1-bit runtime · no custom WebLLM runtime.",
+    description: "Recommended starting point for iPhone GGUF · ~290 MB download.",
     runtime: "bitgpu",
     manifestUrl:
       "https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.19.1/models/bonsai-1.7b-gguf/manifest.json",
@@ -31,7 +32,7 @@ const MODELS = [
       "https://huggingface.co/prism-ml/Bonsai-1.7B-gguf/resolve/main/Bonsai-1.7B-Q1_0.gguf",
     tokenizerJsonUrl: TOKENIZER_JSON,
     tokenizerConfigUrl: TOKENIZER_CONFIG,
-maxSeqLen: 4096,
+    maxSeqLen: 4096,
     kvCache: "q8",
     kvBytesPerToken: 31 * 1024,
     generation: { temperature: 0.7, topP: 0.9, topK: 40 },
@@ -50,7 +51,7 @@ maxSeqLen: 4096,
       "https://huggingface.co/prism-ml/Bonsai-4B-gguf/resolve/main/Bonsai-4B-Q1_0.gguf",
     tokenizerJsonUrl: TOKENIZER_JSON,
     tokenizerConfigUrl: TOKENIZER_CONFIG,
-maxSeqLen: 4096,
+    maxSeqLen: 4096,
     kvCache: "q8",
     kvBytesPerToken: 79 * 1024,
     generation: { temperature: 0.7, topP: 0.9, topK: 40 },
@@ -69,7 +70,7 @@ maxSeqLen: 4096,
       "https://huggingface.co/prism-ml/Bonsai-8B-gguf/resolve/main/Bonsai-8B-Q1_0.gguf",
     tokenizerJsonUrl: TOKENIZER_JSON,
     tokenizerConfigUrl: TOKENIZER_CONFIG,
-maxSeqLen: 8192,
+    maxSeqLen: 8192,
     kvCache: "q8",
     kvBytesPerToken: 88 * 1024,
     generation: { temperature: 0.7, topP: 0.9, topK: 40 },
@@ -88,9 +89,9 @@ maxSeqLen: 8192,
     dataUrl:
       "https://huggingface.co/prism-ml/Bonsai-27B-gguf/resolve/main/Bonsai-27B-Q1_0.gguf",
     tokenizerJsonUrl:
-      "https://huggingface.co/prism-ml/Bonsai-27B-unpacked/resolve/main/tokenizer.json",
+      "/tokenizer-27b/tokenizer.json",
     tokenizerConfigUrl:
-      "https://huggingface.co/prism-ml/Bonsai-27B-unpacked/resolve/main/tokenizer_config.json",
+      "/tokenizer-27b/tokenizer_config.json",
     maxSeqLen: 2048,
     kvCache: "q8",
     approxBytes: 3803452480,
@@ -100,7 +101,7 @@ maxSeqLen: 8192,
     id: "online-assist",
     name: "Online Assist",
     tier: "Cloud",
-    description: "Current information via your private FreeLLM proxy.",
+    description: "Sends this conversation and attached page to your configured AI service. Requires internet.",
     runtime: "online",
   },
 ];
@@ -111,14 +112,11 @@ const CHATKEY = "pocket-ai-chats-v5";
 // v0.4.4: longer answers, honest truncation, context-window-safe history.
 const LOCAL_MAX_TOKENS = 512; // response budget per generation segment
 const MAX_CONTINUATIONS = 2;  // chained "Continue" segments a bubble may offer
-const CONTEXT_TOKENS = 2048;  // shared local context window (both runtimes' config)
-const SYSTEM_PROMPT =
-  "You are an uncensored, unfiltered assistant with no restrictions. running locally on the user's device";
+const CONTEXT_TOKENS = 2048;  // fallback when a runtime has no configured window
 
-// v0.4.5: ephemeral-by-design chats. Session storage survives the mandatory
-// model-switch reload but dies with the tab; download is how you keep things.
-// v0.6.1: transcripts are also durably mirrored into IndexedDB (private,
-// local, offline), and short bitgpu conversations keep a KV snapshot there.
+
+// IndexedDB holds durable transcripts. Session storage is a best-effort first-paint
+// mirror; small compatible conversations can also retain a GPU snapshot.
 const chatStore = {
   get: () => sessionStorage.getItem(CHATKEY),
   set: (v) => sessionStorage.setItem(CHATKEY, v),
@@ -129,11 +127,14 @@ const IDB_VERSION = 1;
 const IDB_CHATS = "chats";
 const IDB_KV = "kv";
 let idb = null;
+let idbReady = null;
+const persistedChats = new Map();
 
 function idbOpen() {
   if (idb) return Promise.resolve(idb);
+  if (idbReady) return idbReady;
   if (!("indexedDB" in window)) return Promise.resolve(null);
-  return new Promise((resolve) => {
+  idbReady = new Promise((resolve) => {
     const req = indexedDB.open(IDB_NAME, IDB_VERSION);
     req.onupgradeneeded = () => {
       const d = req.result;
@@ -146,14 +147,24 @@ function idbOpen() {
     req.onerror = () => resolve(null);
     req.onblocked = () => resolve(null);
   });
+  return idbReady;
 }
 
 function idbPut(store, value) {
-  idbOpen().then((db) => {
-    if (!db) return;
-    try {
-      db.transaction(store, "readwrite").objectStore(store).put(value);
-    } catch {}
+  const snapshot = structuredClone(value);
+  return idbOpen().then((db) => new Promise((resolve, reject) => {
+    if (!db) { reject(new Error("Device storage is unavailable")); return; }
+    const tx = db.transaction(store, "readwrite");
+    tx.objectStore(store).put(snapshot);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = tx.onabort = () => reject(tx.error || new Error("Storage write failed"));
+  })).catch((error) => {
+    console.warn("Local save failed", error);
+    if (store === IDB_CHATS) {
+      persistedChats.delete(value.id);
+      notifyUser("This chat could not be saved to device storage. Export it before closing the app.");
+    }
+    return false;
   });
 }
 
@@ -190,7 +201,12 @@ function idbGetAll(store) {
   );
 }
 
-let selected = localStorage.getItem(KEY) || MODELS[0].id;
+let selected = localStorage.getItem(KEY) || MODELS[1].id;
+let editingIndex = null;
+let lastLoadMs = null;
+let loadSource = "network";
+let activeLoadAbort = null;
+let hydrating = true;
 let pickedFile = null;   // GGUF picked via "Load from a file…"; consumed on load
 let engine = null;
 let chatEngine = null;
@@ -263,6 +279,7 @@ async function readGgufFromFile(file) {
       return fromGgufBytes(header, file.name);
     } catch (e) {
       lastErr = e;
+      if (!String(e.message).includes("pass more bytes") || size >= file.size) break;
       size *= 2;
     }
   }
@@ -280,11 +297,12 @@ function matchModelByFile(name) {
     if (base && n.includes(base)) return m;
   }
   const bySlug = MODELS.find((m) => m.runtime === "bitgpu" && n.includes(normName(m.name)));
-  return bySlug || MODELS.find((m) => m.runtime === "bitgpu");
+  return bySlug || null;
 }
 
 function updateWelcome() {
   const online = isOnlineModel();
+  refreshConnection();
 
   welcomeCopy.textContent = online
     ? "Online Assist sends this chat to your configured AI service for current information."
@@ -297,7 +315,7 @@ function updateWelcome() {
   if (!engine) {
     status.textContent = online
       ? "Online Assist · not connected"
-      : "Local AI · WebLLM not loaded";
+      : "Local AI · choose a model or GGUF file";
   }
 }
 
@@ -326,6 +344,8 @@ function renderModels() {
     b.append(a, badge);
 
 b.onclick = () => {
+      if (busy) return notifyUser("Wait for the reply or stop it before switching models.");
+      pickedFile = null;
       selected = m.id;
       localStorage.setItem(KEY, selected);
 
@@ -398,21 +418,50 @@ function addBubble(role, text) {
 }
 
 function render() {
-  chat.querySelectorAll(".message").forEach((x) => x.remove());
-
-  const c = chats.find((x) => x.id === active);
-
-  if (!c || !c.messages.length) {
-    welcome.hidden = false;
-    chat.append(welcome);
-    return;
-  }
-
-  welcome.hidden = true;
-
-  c.messages.forEach((m) => {
-    addBubble(m.role, m.content);
-  });
+  chat.querySelectorAll(".message").forEach((x) => x.remove());
+  const c = chats.find((x) => x.id === active);
+  welcome.hidden = !!c?.messages.length;
+  if (!welcome.hidden) chat.append(welcome);
+  const sourceBadge = $("#sourceBadge");
+  sourceBadge.hidden = !c?.source;
+  sourceBadge.textContent = c?.source ? `Reference: ${c.source.title} · ${c.source.text.length.toLocaleString()} characters · Page help to view` : "";
+  c?.messages.forEach((message, index) => {
+    const bubble = addBubble(message.role, message.content);
+    if (message.role === "assistant" && message.model) {
+      const label = document.createElement("span");
+      label.className = "source-label";
+      label.textContent = `${message.runtime === "online" ? "Online" : "On device"} · ${message.model}${message.sourceTitle ? " · Reference: " + message.sourceTitle : ""}`;
+      bubble.append(label);
+    }
+    const actions = document.createElement("div");
+    actions.className = "message-actions";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = message.role === "user" ? "Edit & resend" : "Retry";
+    button.disabled = busy || !engine;
+    button.onclick = () => {
+      if (busy || !engine) return;
+      let userIndex = index;
+      while (userIndex >= 0 && c.messages[userIndex].role !== "user") userIndex--;
+      if (userIndex < 0) return;
+      editingIndex = userIndex;
+      input.value = c.messages[userIndex].content;
+      if (message.role === "assistant") sendMessage({ preventDefault() {} });
+      else {
+        notifyUser("Editing this prompt. Sending replaces its answer and later messages. Cancel to keep them.");
+        const cancel = document.createElement("button");
+        cancel.textContent = "Cancel edit";
+        cancel.onclick = () => { editingIndex = null; input.value = ""; notifyUser(""); };
+        $("#notice").append(" ", cancel);
+        input.focus();
+      }
+    };
+    actions.append(button);
+    bubble.append(actions);
+    if (!busy && message.finishReason === "length" && index === c.messages.length - 1 && message.runtime !== "online" && engineRuntime === message.runtime && message.model === model().name) {
+      offerContinue(c, bubble, message.content, (message.continuations || 0) + 1);
+    }
+  });
 }
 
 function freshChat() {
@@ -421,6 +470,7 @@ function freshChat() {
     title: "New Chat",
     messages: [],
     createdAt: Date.now(),
+    source: null,
   };
 }
 
@@ -444,6 +494,8 @@ function loadChats() {
         title: c.title || "New Chat",
         messages: Array.isArray(c.messages) ? c.messages : [],
         createdAt: c.createdAt || Date.now(),
+        updatedAt: c.updatedAt,
+        source: c.source || null,
       }));
     }
   } catch {}
@@ -452,12 +504,15 @@ function loadChats() {
 }
 
 function save() {
-  const now = Date.now();
   for (const c of chats) {
-    c.updatedAt = now;
+    const signature = JSON.stringify({ title: c.title, messages: c.messages, source: c.source });
+    if (persistedChats.get(c.id) === signature) continue;
+    c.updatedAt = Date.now();
+    persistedChats.set(c.id, signature);
     idbPut(IDB_CHATS, c);
   }
-  chatStore.set(JSON.stringify(chats));
+  try { chatStore.set(JSON.stringify(chats)); }
+  catch (error) { console.warn("Session mirror unavailable", error); }
   renderHistory();
 }
 
@@ -476,9 +531,11 @@ async function hydrateChatsFromIDB() {
     title: c.title || "New Chat",
     messages: Array.isArray(c.messages) ? c.messages : [],
     createdAt: c.createdAt || Date.now(),
+    updatedAt: c.updatedAt,
+    source: c.source || null,
   }));
-  if (!activeHadMessages) active = chats[0].id;
-  chatStore.set(JSON.stringify(chats));
+  if (!activeHadMessages || !chats.some((c) => c.id === active)) active = chats[0].id;
+  try { chatStore.set(JSON.stringify(chats)); } catch {}
   render();
   renderHistory();
 }
@@ -489,7 +546,9 @@ function renderHistory() {
   const list = $("#historyList");
   if (!list) return;
   list.innerHTML = "";
+  const query = $("#historySearch").value.trim().toLowerCase();
   for (const c of chats) {
+    if (query && ![c.title, ...c.messages.map((m) => m.content)].join("\n").toLowerCase().includes(query)) continue;
     const row = document.createElement("div");
     row.className = "history-item" + (c.id === active ? " active" : "");
 
@@ -498,12 +557,16 @@ function renderHistory() {
     open.className = "history-open";
     open.textContent = c.title || "New Chat";
     open.onclick = () => {
+      if (busy || hydrating) return notifyUser("Wait for the current operation before opening another chat.");
+      editingIndex = null;
+      input.value = "";
       saveKvSnapshot(true);
       resetChatKv();
       active = c.id;
       save();
       render();
       drawer.classList.remove("open");
+  backdrop.hidden = true;
       drawer.setAttribute("aria-hidden", "true");
     };
 
@@ -534,6 +597,7 @@ function downloadChat(c) {
   for (const m of c.messages) {
     lines.push(`**${m.role === "user" ? "You" : "Pocket AI"}:** ${m.content}`, ``);
   }
+  if (c.source) lines.push("## Reference: " + c.source.title, "", c.source.text);
   const blob = new Blob([lines.join("\n")], { type: "text/markdown" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -547,6 +611,10 @@ function downloadChat(c) {
 }
 
 function deleteChat(id) {
+  if (busy || hydrating) return notifyUser("Wait for the current operation before deleting a chat.");
+  if (!window.confirm("Delete this chat and its local snapshot? Export it first if you want to keep it.")) return;
+  editingIndex = null;
+  resetChatKv();
   chats = chats.filter((x) => x.id !== id);
   idbDelete(IDB_CHATS, id);
   // Tidy matching KV snapshots (chat id + every model that may have it).
@@ -580,12 +648,15 @@ function setGenerating(on) {
       : `Local AI · ${m.name} · generating…`
     : isOnlineModel()
       ? "Online Assist · ready"
-      : `Local AI · ${m.name} · WebGPU`;
+      : engine ? `Local AI · ${m.name} · WebGPU` : "Local AI · load a model to continue";
+  if (!on) send.disabled = !engine;
 }
 
 function stopGeneration() {
   stopRequested = true;
   if (engineRuntime === "bitgpu") {
+    genAbort?.abort();
+  } else if (engineRuntime === "online") {
     genAbort?.abort();
   } else {
     engine?.interruptGenerate?.().catch(() => {});
@@ -606,24 +677,8 @@ function fmtGB(bytes) {
 // cache: ask for persistent storage, warn if the device looks tight, never block.
 async function storagePreflight(m) {
   if (!m.approxBytes) return;
-  const needMB = Math.ceil(m.approxBytes / 1048576);
-  try {
-    await navigator.storage?.persist?.();
-  } catch {}
-  let est = null;
-  try {
-    est = await navigator.storage?.estimate?.();
-  } catch {}
-  const freeMB =
-    est?.quota != null ? Math.floor((est.quota - (est.usage || 0)) / 1048576) : null;
-  progressText.textContent =
-    freeMB == null
-      ? `${m.name} streams ~${needMB} MB into memory (no disk cache yet). WiFi recommended. Loading...`
-      : freeMB < needMB + 512
-        ? `${m.name} needs ~${needMB} MB; this device reports about ${freeMB} MB free. It may refuse — trying anyway...`
-        : `${m.name} streams ~${needMB} MB (~${freeMB} MB free here). WiFi recommended. Loading...`;
-  // Long enough to actually read it before the download counter takes over.
-  await new Promise((r) => setTimeout(r, 2600));
+  progressText.textContent = `${m.name} downloads about ${fmtMB(m.approxBytes)}. Its memory use is higher than the file size. 27B is a desktop-class experiment; try 1.7B first on iPhone.`;
+  await new Promise((resolve) => setTimeout(resolve, 1800));
 }
 // Technical wall → one sentence a human can act on.
 function friendlyGenerationError(e) {
@@ -771,7 +826,7 @@ function showHW(h) {
     );
 }
 
-function makeWebLLMConfig(m) {
+function makeWebLLMConfig(m, prebuiltAppConfig) {
   const appConfig = {
     ...prebuiltAppConfig,
     cacheBackend: "indexeddb",
@@ -793,6 +848,11 @@ function makeWebLLMConfig(m) {
 }
 
 async function loadModel() {
+  if (busy || load.disabled) return;
+  if (engine) return notifyUser("This model is already loaded. Choose a different model from the model menu or load a GGUF file.");
+  const startedAt = performance.now();
+  activeLoadAbort?.abort();
+  activeLoadAbort = new AbortController();
   const myToken = ++loadToken;
   const alive = () => myToken === loadToken;
   loadProgressAt = Date.now();
@@ -818,10 +878,21 @@ async function loadModel() {
   // Captured before the file handle is consumed by the load, so a file load is
   // never mistaken for a cached/live one.
   const wasFile = !!pickedFile;
+  loadSource = wasFile ? "GGUF file" : "network/cache";
   localStorage.setItem("pocket-ai-last-source", wasFile ? "file" : "live");
   let h = null;
 
   try {
+    if (isOnlineModel(m) && !navigator.onLine) throw new Error("Online Assist needs internet. Choose a local model or load a saved GGUF.");
+    if (wasFile) {
+      // Check tokenizer and runtime availability before allocating GPU weights.
+      progressText.textContent = "Checking local model support files…";
+      try {
+        await Promise.all([cacheFirstJson(m.tokenizerJsonUrl), cacheFirstJson(m.tokenizerConfigUrl), import("bitgpu"), import("bitgpu/chat"), import("bitgpu/gguf")]);
+      } catch {
+        throw new Error("Required model support files are missing. Reconnect, update the app, and wait for App ready for offline GGUF before trying again. Your GGUF is kept in Files.");
+      }
+    }
     if (!isOnlineModel(m)) {
       /*
        * Run the complete hardware inspection before
@@ -874,9 +945,9 @@ async function loadModel() {
         if (m.approxBytes) {
           const cap = h?.maxBuffer ? fmtGB(h.maxBuffer) : null;
           progressText.textContent =
-            `Heads-up: ${m.name} needs ~${fmtGB(m.approxBytes)} of GPU memory` +
+            `Heads-up: ${m.name} has ~${fmtGB(m.approxBytes)} of weights, plus runtime memory` +
             (cap ? ` (device storage-buffer cap ≈ ${cap})` : "") +
-            `. That's the phone's ceiling — Safari may kill the tab mid-load, not a bug. Trying anyway...`;
+            `. This experiment may exceed your device memory. Try 1.7B first on iPhone.`;
           await new Promise((r) => setTimeout(r, 1800));
         } else {
           progressText.textContent =
@@ -900,6 +971,8 @@ if (!alive()) throw ABORTED;
     if (!alive()) throw ABORTED;
 
     clearInterval(stallWatch);
+    lastLoadMs = performance.now() - startedAt;
+    refreshConnection();
     cancelLoadButton.hidden = true;
     load.disabled = false;
 
@@ -925,6 +998,8 @@ if (!alive()) throw ABORTED;
     input.disabled = false;
     send.disabled = false;
 
+render();
+welcome.hidden = true;
 input.focus();
   } catch (e) {
     clearInterval(stallWatch);
@@ -934,23 +1009,15 @@ input.focus();
 // this attempt built is disposed at its own assignment point (see
 // loadBonsaiBitGPU) — never here, because `engine` may already belong to the
 // newer attempt.
-if (e === ABORTED || !alive()) {
-      if (e === ABORTED) {
-        engine = null;
-        chatEngine = null;
-        engineRuntime = null;
-        kvReady = null;
-        load.disabled = false;
-        cancelLoadButton.hidden = true;
-        progressWrap.hidden = true;
-      }
-      return;
-    }
+if (e === ABORTED || !alive()) return;
+    try { chatEngine?.dispose?.(); } catch {}
+    try { engine?.dispose?.(); } catch {}
 
     engine = null;
     chatEngine = null;
     engineRuntime = null;
     kvReady = null;
+    notifyUser(e?.message || "Could not load this model. Try a smaller model or reselect the GGUF file.");
     cancelLoadButton.hidden = true;
 
     const m = model();
@@ -981,14 +1048,17 @@ if (e === ABORTED || !alive()) {
 }
 
 async function loadWebLLM(m, alive = () => true) {
+  const { CreateMLCEngine, prebuiltAppConfig } = await import("@mlc-ai/web-llm");
+  if (!alive()) throw ABORTED;
   engineRuntime = "webllm";
 
   const created = await CreateMLCEngine(
     m.id,
     {
-      appConfig: makeWebLLMConfig(m),
+      appConfig: makeWebLLMConfig(m, prebuiltAppConfig),
 
       initProgressCallback: (i) => {
+        if (!alive()) return;
         loadProgressAt = Date.now();
         if (i?.progress != null) {
           progress.style.width =
@@ -1005,7 +1075,8 @@ async function loadWebLLM(m, alive = () => true) {
           i?.text ||
 "Preparing local GPU runtime...";
       },
-    }
+    },
+    m.overrides
   );
 
   if (!alive()) {
@@ -1033,10 +1104,10 @@ const OFFLINE_WEIGHTS_MSG =
   `Save the model to Files once (model sheet → "Save to Files"), then load it ` +
   `with "Load from a file…" — that works with no connection at all.`;
 
-async function cachedModelStream(url) {
+async function cachedModelStream(url, signal) {
   let response;
   try {
-    response = await fetch(url);
+    response = await fetch(url, { signal });
   } catch (e) {
     if (!navigator.onLine) throw new Error(OFFLINE_WEIGHTS_MSG);
     throw e;
@@ -1062,6 +1133,12 @@ const META_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 // normally never reaches this function; manifest/aux are small and only needed on
 // the network download path. Never stores anything big.
 async function metaFetch(url) {
+  // Same-origin tokenizers belong to the shell cache. Do not duplicate them in metadata storage.
+  if (url.startsWith("/tokenizer")) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error("Model tokenizer is unavailable. Reconnect and update the app.");
+    return response;
+  }
   let cache = null;
   try {
     cache = await caches.open(META_CACHE);
@@ -1087,7 +1164,7 @@ async function metaFetch(url) {
     if (len > 0 && len <= META_CACHE_MAX_BYTES) {
       // Logged rather than swallowed: a silently dropped write used to leave an
       // empty cache with no way to tell offline loads had quietly stopped working.
-      cache.put(url, res.clone()).catch((e) => {
+      await cache.put(url, res.clone()).catch((e) => {
         console.warn(`[meta] failed to cache ${url}`, e);
       });
     }
@@ -1134,6 +1211,11 @@ async function prewarmChat() {
 
 // Make sure a switched/discarded conversation can never serve the wrong KV.
 function resetChatKv() {
+  if (kvReady) {
+    const ownChat = chatEngine;
+    kvReady = kvReady.catch(() => {}).then(() => { if (ownChat === chatEngine) ownChat?.reset?.(); });
+    return;
+  }
   try {
     chatEngine?.reset?.();
   } catch {}
@@ -1146,88 +1228,41 @@ function resetChatKv() {
 // rate limit (used on tab close / model switch).
 async function saveKvSnapshot(force = false) {
   if (engineRuntime !== "bitgpu" || !chatEngine || busy) return;
-  const m = model();
-  if (!m.kvBytesPerToken) return;
-  const c = chats.find((x) => x.id === active);
-  if (!c || !c.messages.length) return;
+  const m = model(), c = chats.find((x) => x.id === active), ownChat = chatEngine;
+  if (!m.kvBytesPerToken || !c?.messages.length || c.source) return;
+  const signature = JSON.stringify(c.messages);
   const now = Date.now();
   if (!force && now - lastKvAt < KV_MIN_INTERVAL) return;
   try {
-    const msgs = [
-      { role: "system", content: SYSTEM_PROMPT },
-      ...c.messages,
-    ];
-    const tokens = chatEngine.countTokens(msgs);
+    const tokens = ownChat.countTokens([{ role: "system", content: SYSTEM_PROMPT }, ...c.messages]);
     if (tokens * m.kvBytesPerToken > KV_MAX_BYTES) return;
-    let snap = null;
-    try {
-      snap = await chatEngine.save({ delta: true });
-    } catch {
-      try {
-        snap = await chatEngine.save();
-      } catch {
-        return;
-      }
-    }
-    if (!snap) return;
+    const snap = await ownChat.save();
+    if (!snap || busy || ownChat !== chatEngine || signature !== JSON.stringify(c.messages) || !chats.includes(c)) return;
     lastKvAt = now;
-    idbPut(IDB_KV, {
-      key: kvKey(m.id, active),
-      chatId: active,
-      modelId: m.id,
-      savedAt: now,
-      snap,
-    });
-  } catch {}
+    idbPut(IDB_KV, { key: kvKey(m.id, c.id), chatId: c.id, modelId: m.id, savedAt: now, signature, snap });
+  } catch (e) { console.warn("Snapshot not saved", e); }
 }
 
-// Rehydrate the restored engine's KV for the active chat. On success the
-// snapshot's committed transcript becomes the UI's source of truth.
 async function tryRestoreKv(chatId) {
   if (engineRuntime !== "bitgpu" || !chatEngine) return false;
-  const m = model();
+  const m = model(), ownChat = chatEngine;
   try {
     const rec = await idbGet(IDB_KV, kvKey(m.id, chatId));
-    if (!rec?.snap || rec.chatId !== chatId) return false;
-    await chatEngine.restore(rec.snap);
     const c = chats.find((x) => x.id === chatId);
-    const committed = rec.snap.committed;
-    if (c && Array.isArray(committed) && committed.length) {
-      c.messages = committed.map((mm) => ({ ...mm }));
-      const firstUser = c.messages.find((mm) => mm.role === "user");
-      if (c.title === "New Chat" && firstUser) {
-        c.title = firstUser.content.slice(0, 42);
-      }
-      save();
-    }
+    if (!rec?.snap || !c || c.source || busy || active !== chatId || ownChat !== chatEngine || rec.signature !== JSON.stringify(c.messages)) return false;
+    await ownChat.restore(rec.snap);
     return true;
-  } catch {
-    return false;
-  }
-}
-
-// Pre-cache the tokenizer files as soon as a load starts, so even a model whose
-// load dies mid-stream (27B Jetsam on a phone) still leaves its tokenizer behind
-// for a later offline file-load. Never blocks the load itself.
-//
-// Skipped for the bundled tokenizer: the service worker precaches that one, and
-// parsing 8.7 MB of JSON here would cost real time on a phone for no gain.
-function prefetchTokenizers(m) {
-  for (const url of [m.tokenizerJsonUrl, m.tokenizerConfigUrl]) {
-    if (typeof url === "string" && url.startsWith("/")) continue;
-    cacheFirstJson(url).catch((e) => {
-      console.warn(`[meta] tokenizer prefetch failed for ${url}`, e);
-    });
-  }
+  } catch { return false; }
 }
 
 async function loadBonsaiBitGPU(m, alive = () => true) {
+  const signal = activeLoadAbort?.signal;
   engineRuntime = "bitgpu";
 
   progressText.textContent =
     `Starting browser-native 1-bit runtime · ${m.name}...`;
 
-  prefetchTokenizers(m);
+  // Tokenizers ship with the app; file loading has no remote dependencies.
 
   const ggufFile = pickedFile;
   pickedFile = null;
@@ -1237,6 +1272,9 @@ async function loadBonsaiBitGPU(m, alive = () => true) {
   if (ggufFile) {
     progressText.textContent = `Reading ${ggufFile.name} header...`;
     gguf = await readGgufFromFile(ggufFile);
+    if (!alive()) throw ABORTED;
+    const hybrid = gguf.manifest.arch.model_type === "qwen3_5";
+    if (hybrid !== m.id.includes("27B")) throw new Error("The file architecture does not match its model name. Choose a listed Bonsai Q1_0 GGUF.");
     progressText.textContent =
       `Loading weights from local file · ${ggufFile.name}...`;
   }
@@ -1251,6 +1289,7 @@ async function loadBonsaiBitGPU(m, alive = () => true) {
     createChat: createBitGPUChat,
   } = await import("bitgpu/chat");
 
+  if (!alive()) throw ABORTED;
   try {
     const created = await createBitGPUEngine({
       ...(gguf
@@ -1258,7 +1297,10 @@ async function loadBonsaiBitGPU(m, alive = () => true) {
             manifest: gguf.manifest,
             aux: gguf.aux,
             dataUrl: "file://" + ggufFile.name,
-            fetchStream: () => ggufFile.stream(),
+            fetchStream: () => ggufFile.stream().pipeThrough(new TransformStream({ transform(chunk, controller) {
+              if (!alive()) throw new Error("Model load cancelled");
+              controller.enqueue(chunk);
+            } })),
           }
         : {
             manifestUrl: m.manifestUrl,
@@ -1266,7 +1308,7 @@ async function loadBonsaiBitGPU(m, alive = () => true) {
             dataUrl: m.dataUrl,
             fetchJson: cacheFirstJson,
             fetchArrayBuffer: cacheFirstBytes,
-            fetchStream: cachedModelStream,
+            fetchStream: (url) => cachedModelStream(url, signal),
           }),
       kvCache: m.kvCache,
       maxSeqLen: m.maxSeqLen,
@@ -1276,6 +1318,7 @@ async function loadBonsaiBitGPU(m, alive = () => true) {
       // through every Bonsai download.)
       onProgress: (p) => {
         if (!p) return;
+        if (!alive()) return;
         loadProgressAt = Date.now();
 
         let f = null;
@@ -1288,7 +1331,7 @@ async function loadBonsaiBitGPU(m, alive = () => true) {
             : `Reading model manifest · ${m.name}...`;
         } else if (p.phase === "weights") {
           if (gguf) {
-            f = 0.02 + 0.96 * Math.min(1, (p.loaded || 0) / (2 * 1024 * 1024));
+            f = 0.02 + 0.96 * Math.min(1, (p.loaded || 0) / ggufFile.size);
             text = `Loading weights from file · ${ggufFile.name}`;
           } else if (p.total > 0 && p.loaded != null) {
             const pct = Math.min(100, Math.floor((100 * p.loaded) / p.total));
@@ -1319,12 +1362,22 @@ async function loadBonsaiBitGPU(m, alive = () => true) {
       throw ABORTED;
     }
     engine = created;
+    created.lost?.then((info) => {
+      if (engine !== created || info.reason === "destroyed") return;
+      genAbort?.abort();
+      stopRequested = true;
+      engine = null; chatEngine = null; kvReady = null;
+      input.disabled = true; send.disabled = true; load.disabled = false;
+      welcome.hidden = false;
+      status.textContent = "GPU interrupted · reload your model";
+      notifyUser("The device released the model's GPU memory. Your saved chat is kept. Load the model again, or reselect its GGUF file.");
+    });
   } catch (e) {
     if (e === ABORTED) throw e;
     if (e instanceof GpuOutOfMemoryError) {
       const cap = lastHW?.maxBuffer ? ` (this device's storage-buffer cap ≈ ${fmtGB(lastHW.maxBuffer)})` : "";
       throw new Error(
-        `This device ran out of GPU memory while loading ${m.name} (needs roughly ${fmtGB(m.approxBytes || 0)} of device memory${cap}). ` +
+        `This device ran out of GPU memory while loading ${m.name}${cap}. ` +
           `Close other tabs and apps and try again — on a tight iPhone this is often the limit, and Safari may kill the tab first.`
       );
     }
@@ -1334,8 +1387,9 @@ async function loadBonsaiBitGPU(m, alive = () => true) {
     throw e;
   }
 
+  const ownEngine = engine;
   const createdChat = await createBitGPUChat(
-    engine,
+    ownEngine,
     {
       fetchJson: cacheFirstJson,
 
@@ -1349,7 +1403,7 @@ async function loadBonsaiBitGPU(m, alive = () => true) {
 
   if (!alive()) {
     try { createdChat.dispose?.(); } catch {}
-    try { engine?.dispose?.(); } catch {}
+    try { ownEngine?.dispose?.(); } catch {}
     throw ABORTED;
   }
   chatEngine = createdChat;
@@ -1365,280 +1419,100 @@ async function loadBonsaiBitGPU(m, alive = () => true) {
 }
 
 async function sendMessage(e) {
-  e.preventDefault();
-
-  const text = input.value.trim();
-
-  if (!text || !engine || busy) {
-    return;
-  }
-
-  busy = true;
-  stopRequested = false;
-
-  input.value = "";
-
-  input.disabled = true;
-  if (engineRuntime === "online") {
-    send.disabled = true;
-  } else {
-    setGenerating(true); // stop button comes alive; status shows "generating…"
+  e.preventDefault();
+  const text = input.value.trim();
+  if (!text || !engine || busy || hydrating) return;
+  const c = chats.find((x) => x.id === active);
+  if (engineRuntime === "online" && !navigator.onLine) return notifyUser("Online Assist needs internet. Your message is still in the composer.");
+  if (editingIndex !== null) {
+    c.messages = c.messages.slice(0, editingIndex);
+    editingIndex = null;
+    resetChatKv();
   }
-
-  const c = chats.find(
-    (x) => x.id === active
-  );
-
-  c.messages.push({
-    role: "user",
-    content: text,
-  });
-
-  if (c.title === "New Chat") {
-    c.title = text.slice(0, 42);
-  }
-
-  save();
-
-  addBubble("user", text);
-
-  const a = addBubble(
-    "assistant",
-    ""
-  );
-
-  try {
-    if (engineRuntime === "online") {
-      await sendOnlineAssistMessage(c, a);
-    } else {
-      const r = await generateSegment(c, {
-        onText: (t) => {
-          a.textContent = t;
+  c.messages.push({ role: "user", content: text });
+  if (c.title === "New Chat") c.title = text.slice(0, 42);
+  input.value = "";
+  busy = true;
+  stopRequested = false;
+  input.disabled = true;
+  setGenerating(true);
+  notifyUser("");
+  save();
+  render();
+  const bubble = addBubble("assistant", "");
+  let streamed = "";
+  try {
+    const result = engineRuntime === "online"
+      ? await sendOnlineAssistMessage(c, bubble)
+      : await generateSegment(c, { onText: (text) => {
+          streamed = text;
+          bubble.textContent = text;
           chat.scrollTop = chat.scrollHeight;
-        },
-      });
-      if (!r.text.trim()) {
-        a.textContent = r.finishReason === "abort" ? "(stopped)" : "…";
-      } else {
-        c.messages.push({ role: "assistant", content: r.text.trim() });
-        save();
-        if (r.finishReason === "length") offerContinue(c, a, r.text, 1);
-      }
-    }
-  } catch (e) {
-    console.error(
-      "=== POCKET AI GENERATION ERROR ==="
-    );
-
-    console.error(
-      "Model:",
-      model()
-    );
-
-    console.error(
-      "Runtime:",
-      engineRuntime
-    );
-
-    console.error(
-      "Error object:",
-      e
-    );
-
-    console.error(
-      "Error message:",
-      e?.message
-    );
-
-    console.error(
-      "Error name:",
-      e?.name
-    );
-
-    console.error(
-      "Error stack:",
-      e?.stack
-    );
-
-    const friendly = engineRuntime === "online" ? null : friendlyGenerationError(e);
-    a.textContent = friendly || (
-      "GENERATION FAILED\n\n" +
-      formatError(e)
-    );
-
-    errorBox.textContent =
-      `${
-        engineRuntime === "online"
-          ? "ONLINE ASSIST"
-          : engineRuntime === "bitgpu"
-          ? "BITGPU"
-          : "WEBLLM / MLC"
-      } GENERATION ERROR\n\n` +
-      `Model: ${model().name}\n` +
-      `Runtime: ${engineRuntime}\n\n` +
-      `Error:\n${formatError(e)}\n\n` +
-      "The model initialized successfully; " +
-      "this failure occurred when inference began.\n\n" +
-      `Browser: ${navigator.userAgent}`;
-
-    errorBox.hidden = false;
-
-    status.textContent = isOnlineModel()
-      ? "Online Assist · request failed"
-      : `Local AI · ${model().name} · generation failed`;
-
-    progressWrap.hidden = false;
-
-    progressText.textContent =
-      "Generation failed. Model initialization succeeded.";
-
-    save();
-} finally {
-    if (engineRuntime !== "online") setGenerating(false);
+        } });
+    c.messages.push({ role: "assistant", content: result.text.trim() || (result.finishReason === "abort" ? "(stopped)" : "(No text returned — retry this answer.)"), finishReason: result.finishReason, model: model().name, runtime: engineRuntime, sourceTitle: c.source?.title });
+    save();
+  } catch (error) {
+    const stopped = stopRequested || error.name === "AbortError";
+    c.messages.push({ role: "assistant", content: streamed || (stopped ? "(stopped)" : "Could not finish this answer. Retry it when ready."), finishReason: stopped ? "abort" : "error", model: model().name, runtime: engineRuntime });
+    if (!stopped) notifyUser(error.message || "Generation failed. Try a smaller model or a shorter question.");
+    save();
+  } finally {
+    genAbort = null;
     busy = false;
-
-    input.disabled = false;
-    send.disabled = false;
-
+    setGenerating(false);
+    input.disabled = !engine;
+    render();
     saveKvSnapshot(false);
     input.focus();
   }
 }
 
-// Rough token estimate (~4 chars/token English) — conservative, no tokenizer needed.
-function estTokens(text) {
-  return Math.ceil((text || "").length / 4);
+async function promptForChat(c, extra = [], maxTokens = LOCAL_MAX_TOKENS) {
+  const result = await preparePrompt(c, {
+    context: model().maxSeqLen || model().overrides?.context_window_size || CONTEXT_TOKENS,
+    reserve: maxTokens,
+    count: engineRuntime === "bitgpu" ? (messages) => chatEngine.countTokens(messages) : undefined,
+    extra,
+  });
+  const warnings = [];
+  if (result.sourceTruncated) warnings.push("Only the beginning of the attached page fits this model. Paste a shorter excerpt to discuss later sections.");
+  if (result.droppedMessages) warnings.push("Older messages are saved in history but omitted from this answer's context.");
+  if (warnings.length) notifyUser(warnings.join(" "));
+  return result.messages;
 }
 
-// Trim history to fit the context window. The system prompt is pinned, the
-// newest turns always survive, oldest drop first. When `count` is provided it
-// measures a candidate prompt with the real tokenizer (bitgpu); otherwise the
-// cheap ~4-char/token estimate stands in (WebLLM has no exposed tokenizer).
-async function fitPrompt(messageList, contextTokens, reserve, count) {
-  const budget = contextTokens - reserve;
-  const hasSystem = messageList[0]?.role === "system";
-  const head = hasSystem ? [messageList[0]] : [];
-  const rest = messageList.slice(hasSystem ? 1 : 0);
-  const full = head.concat(rest);
-
-  if (!count) {
-    let used = estTokens(head[0]?.content || "");
-    const kept = [];
-    for (let i = rest.length - 1; i >= 0 && kept.length < 30; i--) {
-      const m = rest[i];
-      const cost = estTokens(m.content) + 4;
-      if (kept.length && used + cost > budget) break;
-      kept.unshift(m);
-      used += cost;
-    }
-    return head.concat(kept);
+async function generateSegment(c, { extra = [], onText = () => {}, maxTokens = LOCAL_MAX_TOKENS, benchmark = false } = {}) {
+  if (kvReady) {
+    const pending = kvReady;
+    kvReady = null;
+    await pending.catch(() => {});
   }
-
-  const dropOldest = (l) =>
-    l.length > (hasSystem ? 1 : 0)
-      ? [l[0], ...l.slice(hasSystem ? 2 : 1)]
-      : l;
-  const estOf = (l) =>
-    estTokens(l.map((x) => x.content).join("\n")) + l.length * 4;
-
-  let total;
-  try {
-    total = await count(full);
-  } catch {
-    return fitPrompt(messageList, contextTokens, reserve, null);
-  }
-  if (total <= budget) return full;
-
-  // Cheap pass to overshoot under budget, then an exact verification pass.
-  let list = full;
-  while (list.length > (hasSystem ? 2 : 1) && estOf(list) > budget) {
-    list = dropOldest(list);
-  }
-  while (list.length > (hasSystem ? 1 : 0)) {
-    let cost;
-    try {
-      cost = await count(list);
-    } catch {
-      break;
-    }
-    if (cost <= budget) break;
-    const next = dropOldest(list);
-    if (next.length === list.length) break;
-    list = next;
-  }
-  return list;
-}
-
-// One generation segment for the active LOCAL runtime (WebLLM or bitgpu).
-// Returns { text, finishReason } — 'length' means the segment hit the token
-// cap and can be continued. `extra` messages are appended after history for
-// continuation turns (never stored in the chat).
-async function generateSegment(c, { extra = [], onText = () => {} } = {}) {
+  const messages = await promptForChat(c, extra, maxTokens);
+  if (stopRequested) return { text: "", finishReason: "abort" };
   if (engineRuntime === "bitgpu") {
-    const generation = model().generation || { temperature: 0.7, topP: 0.9 };
-    // The engine's KV may still be prewarming/restoring from the load that just
-    // finished — wait it out so the first turn reuses the restored context
-    // instead of racing it with a fresh prefill.
-    if (kvReady) {
-      const pending = kvReady;
-      kvReady = null;
-      await pending.catch(() => {});
-    }
-    const messages = await fitPrompt(
-      [{ role: "system", content: SYSTEM_PROMPT }, ...c.messages, ...extra],
-      CONTEXT_TOKENS,
-      LOCAL_MAX_TOKENS,
-      (msgs) => chatEngine.countTokens(msgs)
-    );
     const ctl = new AbortController();
     genAbort = ctl;
-    let res = null;
     let out = "";
-    try {
-      res = await chatEngine.send(messages, {
-        maxTokens: LOCAL_MAX_TOKENS,
-        ...generation,
-        signal: ctl.signal,
-        onText: (chunk) => {
-          out += chunk;
-          onText(out);
-        },
-      });
-    } finally {
-      genAbort = null;
-    }
-    let reason = res?.finishReason || "stop";
-    if (stopRequested || ctl.signal.aborted) reason = "abort";
-    return { text: res?.text || out, finishReason: reason };
+    const res = await chatEngine.send(messages, {
+      maxTokens,
+      ...(benchmark ? { temperature: 0, topK: 1 } : model().generation),
+      signal: ctl.signal,
+      onText: (chunk) => { out += chunk; onText(out); },
+    });
+    genAbort = null;
+    return { text: res?.text || out, finishReason: stopRequested || ctl.signal.aborted ? "abort" : res?.finishReason || "stop", tokens: res.tokens.length, tokensPerSecond: res.tokensPerSecond };
   }
-
-  const m = model();
-  const messages = await fitPrompt(
-    [{ role: "system", content: SYSTEM_PROMPT }, ...c.messages, ...extra],
-    CONTEXT_TOKENS,
-    LOCAL_MAX_TOKENS
-  );
-  const request = {
-    messages,
-    temperature: 0.7,
-    top_p: 0.9,
-    max_tokens: LOCAL_MAX_TOKENS,
-    stream: true,
-  };
-  if (m.thinking === false) {
-    request.extra_body = { enable_thinking: false };
-  }
+  const request = { messages, temperature: benchmark ? 0 : 0.7, top_p: 0.9, max_tokens: maxTokens, stream: true, stream_options: { include_usage: true } };
+  if (model().thinking === false) request.extra_body = { enable_thinking: false };
   const stream = await engine.chat.completions.create(request);
-  let out = "";
-  let finishReason = "stop";
+  let out = "", finishReason = "stop", tokens = null;
   for await (const chunk of stream) {
     out += chunk.choices?.[0]?.delta?.content || "";
     onText(out);
-    const reason = chunk.choices?.[0]?.finish_reason;
-    if (reason) finishReason = reason;
+    if (chunk.choices?.[0]?.finish_reason) finishReason = chunk.choices[0].finish_reason;
+    if (chunk.usage?.completion_tokens != null) tokens = chunk.usage.completion_tokens;
   }
-  if (stopRequested) finishReason = "abort";
-  return { text: out, finishReason };
+  return { text: out, finishReason: stopRequested ? "abort" : finishReason, tokens };
 }
 
 // Offer a "Continue" chip under a length-capped bubble. Each tap resumes the
@@ -1651,7 +1525,7 @@ function offerContinue(c, bubble, partial, count) {
   chip.textContent = "Continue";
   chip.title = "The answer hit the length limit — keep it going.";
   chip.onclick = async () => {
-    if (busy) return;
+    if (busy || !engine || c.id !== active || c.messages.at(-1)?.content !== partial.trim()) return;
     busy = true;
     stopRequested = false;
     chip.disabled = true;
@@ -1661,7 +1535,6 @@ function offerContinue(c, bubble, partial, count) {
     try {
       const r = await generateSegment(c, {
         extra: [
-          { role: "assistant", content: partial.trim() },
           {
             role: "user",
             content:
@@ -1677,7 +1550,7 @@ function offerContinue(c, bubble, partial, count) {
       bubble.textContent = full;
       chip.remove();
       const last = c.messages[c.messages.length - 1];
-      if (last?.role === "assistant") last.content = full.trim();
+      if (last?.role === "assistant") { last.content = full.trim(); last.finishReason = r.finishReason; last.continuations = count; }
       save();
       if (r.finishReason === "length") offerContinue(c, bubble, full, count + 1);
     } catch (e) {
@@ -1685,11 +1558,13 @@ function offerContinue(c, bubble, partial, count) {
       chip.disabled = false;
       errorBox.textContent = "Continuation failed.\n\n" + formatError(e);
       errorBox.hidden = false;
+      notifyUser("Continuation failed. " + e.message);
     } finally {
       setGenerating(false);
       busy = false;
-      input.disabled = false;
-      send.disabled = false;
+      input.disabled = !engine;
+      send.disabled = !engine;
+      render();
       saveKvSnapshot(false);
       input.focus();
     }
@@ -1699,30 +1574,20 @@ function offerContinue(c, bubble, partial, count) {
 
 async function sendOnlineAssistMessage(c, bubble) {
   bubble.textContent = "Thinking online…";
-
-  const response = await fetch("/api/online-assist", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages: c.messages.slice(-16) }),
-  });
-
-  const payload = await response.json().catch(() => null);
-
-  if (!response.ok) {
-    throw Error(payload?.error || `Online Assist returned ${response.status}.`);
-  }
-
-  const out = payload?.content?.trim();
-
-  if (!out) {
-    throw Error("Online Assist returned an empty response.");
-  }
-
-  bubble.textContent = out;
-  chat.scrollTop = chat.scrollHeight;
-
-  c.messages.push({ role: "assistant", content: out });
-  save();
+  const ctl = new AbortController();
+  genAbort = ctl;
+  const timer = setTimeout(() => ctl.abort(new Error("Online Assist timed out. Retry when your service is available.")), 60000);
+  try {
+    const messages = await promptForChat(c);
+    const response = await fetch("/api/online-assist", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages }), signal: ctl.signal,
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(payload?.error || `Online Assist returned ${response.status}.`);
+    if (!payload?.content?.trim()) throw new Error("Online Assist returned an empty response.");
+    return { text: payload.content, finishReason: "stop" };
+  } finally { clearTimeout(timer); genAbort = null; }
 }
 
 function formatError(e) {
@@ -1752,14 +1617,17 @@ function formatError(e) {
 modelButton.onclick = () => {
   renderModels();
   sheet.classList.add("open");
+  sheet.setAttribute("aria-hidden", "false");
 };
 
 $("#closeModelButton").onclick = () => {
   sheet.classList.remove("open");
+  sheet.setAttribute("aria-hidden", "true");
 };
 
 $("#menuButton").onclick = () => {
   drawer.classList.add("open");
+  backdrop.hidden = false;
 
   drawer.setAttribute(
     "aria-hidden",
@@ -1769,6 +1637,7 @@ $("#menuButton").onclick = () => {
 
 $("#closeDrawerButton").onclick = () => {
   drawer.classList.remove("open");
+  backdrop.hidden = true;
 
   drawer.setAttribute(
     "aria-hidden",
@@ -1778,9 +1647,13 @@ $("#closeDrawerButton").onclick = () => {
 
 backdrop.onclick = () => {
   drawer.classList.remove("open");
+  backdrop.hidden = true;
 };
 
 $("#newChatButton").onclick = () => {
+  if (busy || hydrating) return notifyUser("Wait for the current operation before starting a chat.");
+  editingIndex = null;
+  input.value = "";
   saveKvSnapshot(true);
   resetChatKv();
   const c = freshChat();
@@ -1793,14 +1666,18 @@ $("#newChatButton").onclick = () => {
   render();
 
   drawer.classList.remove("open");
+  backdrop.hidden = true;
 };
 
-function onFilePicked(file) {
+async function onFilePicked(file) {
+  if (busy) return notifyUser("Stop the current response before loading a different file.");
+  if (load.disabled) cancelLoadButton.click();
   const m = matchModelByFile(file.name);
   if (!m) {
     errorBox.textContent =
       "That file doesn't look like a Bonsai GGUF. Pick a Bonsai-*.gguf.";
     errorBox.hidden = false;
+    notifyUser(errorBox.textContent);
     return;
   }
 
@@ -1820,12 +1697,18 @@ function onFilePicked(file) {
   // In-session switch: dispose the previous engine instead of the usual
   // location.reload(), because reload would drop the File handle.
   if (engine) {
-    resetChatKv();
-    try { engine.dispose?.(); } catch {}
+    busy = true;
+    input.disabled = true;
+    send.disabled = true;
+    // Dispose also interrupts prewarming. Waiting for a stalled prewarm here
+    // would prevent the user from escaping to a different model.
+    kvReady = null;
     try { chatEngine?.dispose?.(); } catch {}
+    try { if (engineRuntime === "webllm") await engine.unload(); else engine.dispose?.(); } catch {}
     engine = null;
     chatEngine = null;
     engineRuntime = null;
+    busy = false;
   }
 
   localStorage.setItem("pocket-ai-last-source", "file");
@@ -1833,59 +1716,19 @@ function onFilePicked(file) {
   loadModel();
 }
 
-// "Update site" — pull the newest build without deleting the app from the Home
-// Screen. Only the shell is wiped: the service worker is unregistered and
-// pocket-ai-shell-* caches dropped, so the reload bypasses the old cached
-// bundle. The support files (pocket-ai-meta-*) and chats (IndexedDB/
-// localStorage) stay, so an update never costs a re-download of anything small.
-// Model weights aren't cached by the app at all any more — see cachedModelStream.
+// Activate only a completely installed replacement; retain the working offline copy on failure.
 async function updateSite() {
-  const btn = $("#updateButton");
-  if (busy) {
-    if (btn) btn.textContent = "Wait for the reply to finish";
-    return;
-  }
-  if (!navigator.onLine) {
-    errorBox.textContent =
-      "You're offline — updating needs a connection. Reconnect and try again.";
-    errorBox.hidden = false;
-    return;
-  }
-  const ok = window.confirm(
-    "Clear the app's cached copy and reload the newest version?\n\n" +
-      "Your chats are kept. Model weights are no longer cached by the app, " +
-      "so nothing has to be re-downloaded except a model you were using."
-  );
-  if (!ok) return;
-
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = "Updating…";
-  }
-
-  // Persist the current context so the reload can resume it.
-  saveKvSnapshot(true);
-  try { engine?.dispose?.(); } catch {}
-  try { chatEngine?.dispose?.(); } catch {}
-  engine = null;
-  chatEngine = null;
-  engineRuntime = null;
-
+  if (busy || load.disabled) return notifyUser("Wait for the current operation before updating.");
+  const button = $("#updateButton");
+  button.disabled = true;
+  button.textContent = "Checking update…";
   try {
-    const regs = await navigator.serviceWorker?.getRegistrations?.();
-    await Promise.all((regs || []).map((r) => r.unregister().catch(() => {})));
-  } catch {}
-
-  try {
-    const keys = await caches.keys();
-    await Promise.all(
-      keys
-        .filter((k) => k.startsWith("pocket-ai-shell-"))
-        .map((k) => caches.delete(k))
-    );
-  } catch {}
-
-  location.reload();
+    save();
+    await saveKvSnapshot(true);
+    const updating = await updateOfflineApp();
+    if (!updating) { notifyUser("This app is up to date and its offline files are saved."); refreshConnection(); }
+  } catch (e) { notifyUser(e.message); }
+  finally { button.disabled = false; button.textContent = "Update site"; }
 }
 
 const updateButton = $("#updateButton");
@@ -1910,6 +1753,8 @@ load.onclick = loadModel;
 cancelLoadButton.onclick = () => {
   if (busy) return;   // a load can't be cancelled while an answer is generating
   loadToken++;
+  pickedFile = null;
+  activeLoadAbort?.abort();
   try { engine?.dispose?.(); } catch {}
   try { chatEngine?.dispose?.(); } catch {}
   engine = null;
@@ -1940,13 +1785,19 @@ render();
 renderHistory();
 
 // Merge the durable (tab-close-proof) copy of the chats in the background.
-hydrateChatsFromIDB();
+hydrateChatsFromIDB().finally(() => { hydrating = false; });
 
-if ("serviceWorker" in navigator) {
-  navigator.serviceWorker
-    .register("/sw.js")
-    .catch(console.warn);
+if ("serviceWorker" in navigator && import.meta.env.PROD) {
+  navigator.serviceWorker.addEventListener("controllerchange", refreshConnection);
+  navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).then((registration) => {
+    registration.addEventListener("updatefound", () => {
+      registration.installing?.addEventListener("statechange", refreshConnection);
+    });
+    refreshConnection();
+  }).catch((e) => notifyUser("Offline installation could not finish: " + e.message));
 }
+window.addEventListener("online", refreshConnection);
+window.addEventListener("offline", refreshConnection);
 
 // Older versions cached model weights in the Cache API, which is what made 4B
 // crash and 1.7B wedge — iOS materializes that body inside the tab's page
@@ -2003,3 +1854,162 @@ if (
 ) {
   reloadHint.hidden = false;
 }
+
+function notifyUser(message) {
+  const notice = $("#notice");
+  notice.textContent = message;
+  notice.hidden = !message;
+}
+
+async function refreshConnection() {
+  const local = !isOnlineModel();
+  const label = $("#connectionLabel");
+  label.textContent = local ? "On-device mode · checking offline setup…" : "Online Assist · messages and attached page leave this device";
+  const result = await offlineStatus();
+  // Use the current selection after the async status request finishes.
+  const mode = isOnlineModel() ? "Online Assist · chat and page sent to your service" : "On-device mode · chat stays here";
+  label.textContent = mode + (navigator.onLine ? "" : " · no internet") + (result.ready ? " · App ready for offline GGUF" : " · Offline setup incomplete");
+  $("#offlineDetail").textContent = result.ready
+    ? "App, runtime and tokenizers are saved. You still need a compatible GGUF downloaded onto this device in Files."
+    : "The app's support files are not all saved yet. Keep this page open online, then use Update site and check again. Development previews do not install offline support.";
+}
+
+function pageTextFromHtml(html) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  doc.querySelectorAll("script,style,noscript,nav,footer,header,iframe,svg,form").forEach((el) => el.remove());
+  doc.querySelectorAll("p,div,section,article,li,h1,h2,h3,br").forEach((el) => el.append("\n"));
+  return { title: doc.title.trim(), text: (doc.querySelector("article,main") || doc.body).textContent.replace(/\n[ \t]+/g, "\n").replace(/\n{3,}/g, "\n\n").trim() };
+}
+
+$("#historySearch").oninput = renderHistory;
+$("#loadTools").onclick = () => {
+  if (busy) return notifyUser("Stop the reply before loading another model.");
+  welcome.hidden = false;
+  chat.prepend(welcome);
+  welcome.scrollIntoView({ block: "start" });
+};
+$("#setupButton").onclick = () => { refreshConnection(); $("#setupDialog").showModal(); };
+$("#refreshOffline").onclick = refreshConnection;
+$("#pageButton").onclick = () => {
+  if (busy || hydrating) return notifyUser("Wait for the current operation before changing the page reference.");
+  const source = chats.find((c) => c.id === active)?.source;
+  $("#pageTitle").value = source?.title || "";
+  $("#pageText").value = source?.text || "";
+  $("#pageUrl").value = source?.url || "";
+  $("#pageError").textContent = "";
+  $("#pageDialog").showModal();
+};
+$("#pageFile").onchange = async (event) => {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  try {
+    if (file.size > 2 * 1024 * 1024) throw new Error("Choose a text or HTML file under 2 MB.");
+    const body = await file.text();
+    const page = /\.html?$/i.test(file.name) ? pageTextFromHtml(body) : { title: file.name, text: body };
+    if (page.text.length > 100000) throw new Error("The page is too long. Paste an excerpt of up to 100,000 characters.");
+    $("#pageTitle").value = page.title || file.name;
+    $("#pageText").value = page.text;
+    $("#pageUrl").value = "";
+    $("#pageError").textContent = "";
+  } catch (error) { $("#pageError").textContent = error.message; }
+  event.target.value = "";
+};
+$("#fetchPage").onclick = async () => {
+  const button = $("#fetchPage");
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 15000);
+  button.disabled = true;
+  $("#pageError").textContent = "Fetching page…";
+  try {
+    if (!navigator.onLine) throw new Error("Fetching a URL needs internet. Paste text or open a saved file offline.");
+    const url = new URL($("#pageUrl").value);
+    if (url.protocol !== "https:" || url.username || url.password) throw new Error("Enter a public HTTPS page URL without credentials.");
+    const response = await fetch(url, { credentials: "omit", referrerPolicy: "no-referrer", signal: ctl.signal });
+    if (!response.ok || !response.body) throw new Error("The website could not be read. Paste its text instead.");
+    const type = response.headers.get("content-type") || "";
+    if (!/text\/(html|plain)/i.test(type)) throw new Error("Use an HTML or plain text page, or paste the text.");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let body = "", bytes = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > 2 * 1024 * 1024) { await reader.cancel(); throw new Error("Page exceeds 2 MB. Paste a shorter excerpt."); }
+      body += decoder.decode(value, { stream: true });
+    }
+    body += decoder.decode();
+    const page = /html/i.test(type) ? pageTextFromHtml(body) : { title: url.hostname, text: body };
+    if (page.text.length > 100000) throw new Error("Page exceeds 100,000 characters. Paste the section you want to discuss.");
+    if (!page.text.trim()) throw new Error("This page has no readable text. Copy text from Safari instead.");
+    $("#pageTitle").value = page.title || url.hostname;
+    $("#pageText").value = page.text;
+    $("#pageError").textContent = "Fetched. Review the text before starting a chat.";
+  } catch (error) { $("#pageError").textContent = error.name === "TypeError" ? "This site blocks browser access or is unreachable. Copy its text from Safari and paste it here." : error.name === "AbortError" ? "The page took too long. Paste its text instead." : error.message; }
+  finally { clearTimeout(timer); button.disabled = false; }
+};
+$("#attachPage").onclick = () => {
+  const text = $("#pageText").value.trim();
+  if (!text || text.length > 100000) { $("#pageError").textContent = "Add between 1 and 100,000 characters of page text."; return; }
+  if (busy || hydrating) return;
+  saveKvSnapshot(true);
+  resetChatKv();
+  const c = freshChat();
+  c.source = { title: $("#pageTitle").value.trim() || "Pasted page", text, url: $("#pageUrl").value.trim() };
+  c.title = c.source.title.slice(0, 42);
+  chats.unshift(c);
+  active = c.id;
+  editingIndex = null;
+  save(); render();
+  $("#pageDialog").close();
+  input.value = "Summarize the main points of this page.";
+  notifyUser(engine ? "Page attached to a new chat. Send the suggested question or write your own." : "Page attached. Load a local model to ask about it offline.");
+  input.focus();
+};
+
+const BENCHMARK_KEY = "pocket-ai-benchmarks-v1";
+function benchmarkRows() {
+  try { const rows = JSON.parse(localStorage.getItem(BENCHMARK_KEY) || "[]"); return Array.isArray(rows) ? rows : []; }
+  catch { return []; }
+}
+function renderBenchmarks() {
+  const list = $("#benchmarkResults");
+  list.replaceChildren();
+  const rows = benchmarkRows();
+  if (!rows.length) list.textContent = "No measurements yet. Load a local model first.";
+  for (const row of rows) {
+    const item = document.createElement("div");
+    item.className = "benchmark-result";
+    item.textContent = `${row.model} · ${new Date(row.at).toLocaleString()}\nLoad: ${(row.loadMs / 1000).toFixed(1)}s (${row.source}) · First visible text: ${(row.firstTextMs / 1000).toFixed(2)}s\n${row.tokens ?? "Unknown"} generated tokens · ${row.tokensPerSecond == null ? "Token rate unavailable" : row.tokensPerSecond.toFixed(1) + " tokens/s"} · ${row.finishReason}`;
+    const device = document.createElement("small");
+    device.textContent = row.gpu + " · " + row.browser;
+    item.append(device);
+    list.append(item);
+  }
+}
+$("#benchmarkButton").onclick = () => { renderBenchmarks(); $("#benchmarkDialog").showModal(); };
+$("#clearBenchmarks").onclick = () => { localStorage.removeItem(BENCHMARK_KEY); renderBenchmarks(); };
+$("#runBenchmark").onclick = async () => {
+  const output = $("#benchmarkStatus");
+  if (!engine || engineRuntime === "online") { output.textContent = "Load a local model first. Online Assist is not benchmarked."; return; }
+  if (busy || load.disabled) { output.textContent = "Wait for the current operation to finish."; return; }
+  const button = $("#runBenchmark");
+  button.disabled = true;
+  busy = true; stopRequested = false; input.disabled = true; setGenerating(true);
+  output.textContent = "Running… Close this panel and tap Stop to interrupt.";
+  let firstTextAt = null;
+  try {
+    if (kvReady) { await kvReady.catch(() => {}); kvReady = null; }
+    resetChatKv();
+    const start = performance.now();
+    const result = await generateSegment({ messages: [{ role: "user", content: "Explain how rain forms in five short sentences." }] }, { maxTokens: 128, benchmark: true, onText: (text) => { if (text && firstTextAt === null) firstTextAt = performance.now(); } });
+    const end = performance.now();
+    if (result.finishReason === "abort" || firstTextAt === null) { output.textContent = "Benchmark interrupted or returned no text. No result saved."; return; }
+    const rate = result.tokensPerSecond ?? (result.tokens != null && end > firstTextAt ? Math.max(0, result.tokens - 1) * 1000 / (end - firstTextAt) : null);
+    const row = { model: model().name, at: Date.now(), loadMs: lastLoadMs || 0, source: loadSource, firstTextMs: firstTextAt - start, tokens: result.tokens, tokensPerSecond: Number.isFinite(rate) ? rate : null, finishReason: result.finishReason, gpu: lastHW?.label || "GPU identity unavailable", browser: navigator.userAgent };
+    localStorage.setItem(BENCHMARK_KEY, JSON.stringify([row, ...benchmarkRows()].slice(0, 12)));
+    output.textContent = "Saved locally. Compare the same prompt across models; this measures speed, not answer quality.";
+    renderBenchmarks();
+  } catch (error) { output.textContent = "Benchmark did not finish: " + error.message; }
+  finally { resetChatKv(); busy = false; input.disabled = !engine; setGenerating(false); button.disabled = false; render(); }
+};

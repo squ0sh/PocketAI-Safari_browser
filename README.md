@@ -1,179 +1,102 @@
 # Pocket AI
 
-> **Private 1-bit local AI chat · v0.6.0**
-> Low-bit LLMs running directly on your device GPU. No server,
-> no API key, no uploads. Install it to your iPhone Home Screen and it behaves like an app.
+> Private on-device chat for iPhone Safari · v0.7.0
 
-Built on [bitgpu](https://github.com/stfurkan/bitgpu) — a dependency-free WebGPU runtime
-for 1-bit Bonsai models — with MLC/WebLLM as the baseline runtime and an optional
-**Online Assist** cloud mode.
+Pocket AI runs supported local models using WebGPU. Its Bonsai GGUF file path works offline after the app has finished installing its support files. Online Assist is a separate, explicit remote option.
 
----
+## Start here
 
-## What it does
-
-- **Truly local.** Weights stream to your device and inference runs on the GPU; nothing leaves the phone. Load the page and the app works — or go further and load models from a file, and it works offline too.
-- **1-bit Bonsai Qwen3 models** via the native WebGPU path — pocket-sized files at unusually small memory footprints (a 27B at ~1.1 bits/weight).
-- **PWA-first on iOS.** Real manifest, PNG touch icon, `black-translucent` status bar — it installs and launches full-screen.
-- **Optional Online Assist** for current information, proxied through a private Firebase Function so no key ever ships in the client.
-
-## Model lineup
-
-| Model | Runtime | First load | Status |
-|---|---|---|---|
-| Qwen 0.5B | MLC/WebLLM | IndexedDB cache | Known-good baseline |
-| Bonsai 1.7B Q1 | bitgpu/WebGPU | Cache API (~290 MB) or file | Confirmed working |
-| Bonsai 4B Q1 | bitgpu/WebGPU | Network or file (~570 MB) | Working |
-| Bonsai 8B Q1 | bitgpu/WebGPU | Network or file (~1.16 GB) | Working — **largest that fits a phone** |
-| Bonsai 27B Q1 | bitgpu/WebGPU | Local GGUF file, or ~3.8 GB stream | Desktop-class; phones may refuse |
-
-Every Bonsai row exposes a **"Save to Files"** chip (Safari's resumable download) and a
-**"Load from a file…"** picker, so any model can run straight from a local `.gguf` —
-no re-downloading, no web-storage quota involved, and it works with no connection at all.
-That's the offline route for every model: **the app deliberately caches no weights** (see
-[Why weights are never cached](#why-weights-are-never-cached)).
-
-Qwen3 1.7B is intentionally omitted from this build while Bonsai bitgpu testing continues.
-
-## The 1-bit model landscape — why 8B is the iPhone ceiling
-
-bitgpu accepts exactly one format: **binary 1-bit GGUF in ggml type `Q1_0`**, on a
-`qwen3` dense or `qwen3.5` hybrid architecture. Everything else hard-fails at load
-(and the engine validates loudly, never silently).
-
-| Rung | What exists | Fits a phone? |
-|---|---|---|
-| ≤ 1.7B | Bonsai 1.7B | ✔ Confirmed |
-| 4B | Bonsai 4B | ✔ Works |
-| 8B | Bonsai 8B | ✔ **The practical ceiling** |
-| 8B → 27B | — *nothing* — | ✗ This gap has no entries |
-| 27B | Bonsai 27B (hybrid) | ✗ Desktop-class; phones usually die |
-
-We audited the Hugging Face Hub for a mid-size rung and every lead falls at the same gate:
-
-- **Ternary-Bonsai (Q2_0)** — ternary `{−1, 0, +1}` packing, not type `Q1_0`; and *bigger* (7.2 GB), so it would be worse, not better.
-- **Ollama's "Bonsai 27B Q1"** — an unofficial mirror of the identical `Bonsai-27B-Q1_0.gguf` we already ship: same bytes, same size, same memory ceiling.
-- **Qwen3-14B & friends** — only standard multi-bit quants (`Q2_K` … `Q4_K_M`); wrong type, and 5.7 GB+ anyway.
-- **`Qwen3-14B-medusa-1bit`** — raw medusa-head tensor dumps, not a loadable model.
-- **`1bit-MONSTER/*`** — the "1bit" is the org's name; repos actually hold `Q4_K_M` files.
-- **llama.cpp `IQ1_S`/`IQ1_M`** — genuine ~1-bit, but ggml types 33/34, not 41.
-
-So **8B is the real iPhone ceiling and 27B is the next step up — there is no middle
-tier from anyone.** Should PrismML ever ship a mid-size Bonsai, it drops straight into
-the data-driven `MODELS` config (the file-load path already matches picks by filename)
-as a one-entry change — no new plumbing.
-
-## Run it
-
-```bash
+```sh
 npm install
 npm run dev
 ```
 
-Open the HTTPS Vite address on the iPhone.
+The development server uses HTTPS. Offline installation is enabled in production builds, including a local production preview:
 
-### Before shipping
-
-`npm run check` is the whole local gate: it syntax-checks the app and functions, runs the
-production build, then boots the fresh `dist/` headless over CDP and asserts the model
-tiles and history drawer render with zero boot errors (auto-skips the browser probe when
-no Chromium is on PATH). CI runs it on every push.
-
-```bash
-npm run check
+```sh
+npm run build
+npm run preview
 ```
 
-### Deploy
+No model downloads or starts automatically. New users start with Bonsai 1.7B selected; an existing selection is preserved. Choose **Load Local AI**, or **Load from a file…** in the model menu.
 
-Builds are ephemeral (`dist/`/`.vite/` are untracked). By hand:
+## Take a GGUF offline
 
-```bash
-npm run build && firebase deploy
-```
+1. Open the production app online. Wait for **App ready for offline GGUF**. On iPhone, add it to the Home Screen through Safari's Share menu.
+2. Use **Save to Files** in the model menu. Ensure the GGUF is downloaded onto the device, not only present in iCloud.
+3. Reopen in airplane mode. Choose **Load from a file…** and select the saved GGUF. A File handle cannot survive a restart, so you must select it again each session.
 
-Firebase hosting auto-deploys from the GitHub Actions workflow on every push.
+The installed bundle includes every JavaScript chunk, stylesheet and both tokenizer families. The GGUF supplies its own manifest and weight data. File loads check the support files before allocating GPU weights. The 27B tokenizer is now bundled too; this does **not** make its memory requirements suitable for every phone.
+
+Bonsai weights are streamed from Files or the network and are never written to Cache API storage. This preserves the project's workaround for large in-page cache writes on Safari. The app shell and tokenizers **do** use the service worker's Cache API storage. Safari can evict website storage, so check readiness before travelling and retain your GGUF in Files.
+
+**Update site** installs a complete replacement before switching over. A failed update keeps the working offline copy. Chat history and model metadata are preserved.
+
+## Model choices
+
+| Model | Runtime | Use |
+| --- | --- | --- |
+| Qwen 0.5B | WebLLM | Small baseline; separate runtime-managed model cache, not a GGUF file load |
+| Bonsai 1.7B Q1 | bitgpu | Recommended starting point for GGUF on iPhone; roughly 290 MB download |
+| Bonsai 4B Q1 | bitgpu | Larger option; roughly 570 MB download |
+| Bonsai 8B Q1 | bitgpu | Experimental; roughly 1.16 GB download |
+| Bonsai 27B Q1 | bitgpu | Desktop-class experiment; roughly 3.8 GB of weights plus runtime memory |
+
+File loading supports the listed **Bonsai Q1_0 GGUF** releases, with their recognizable Bonsai filenames. It does not support arbitrary GGUF quantizations. Unknown filenames and incompatible architectures produce an error. There is no universally guaranteed iPhone model ceiling: available memory, context allocation, browser version and other apps all matter.
+
+## Chat and page help
+
+- Local answers stream as they are generated. Stop preserves partial text. Retry regenerates an answer; Edit & resend replaces the edited turn and subsequent messages after you send.
+- History is stored in IndexedDB and is searchable by title or message. Export a Markdown transcript, including an attached reference, or delete a chat and its snapshots.
+- **Page help** accepts pasted text or a saved text/HTML file. Each attachment starts a new chat and is retained across reloads. HTML scripts are not inserted into the live page.
+- Local page questions work offline. The model receives a bounded excerpt, with a visible notice when the full source or older messages do not fit. Shorten the source to ask about a later section. This is page-context prompting, not a document search index.
+- **Fetch a URL online** is an explicit direct request to that website. Browser CORS restrictions may block it; paste text instead. It requires HTTPS and limits downloads to 2 MB. Page text is capped at 100,000 characters.
+- Context budgeting uses bitgpu's tokenizer and each model's configured window: 4K for 1.7B/4B, 8K for 8B, 2K for 27B. WebLLM uses a conservative text estimate. An oversized newest request is rejected, never silently discarded.
+
+Transcripts are authoritative. A compatible short-chat KV snapshot can accelerate reopening; it never replaces newer chat messages. Chats with page references skip snapshots. Storage errors tell the user to export their chat.
+
+## Measure your device
+
+**Speed test** runs the same 128-token-budget prompt on the currently loaded local model. It records load time/source, time to first visible text, generated token count, generation speed, GPU information when available, and browser identity. It does not infer an iPhone model or available memory. Measurements stay on the device and can be cleared.
+
+Temperature, battery state, GPU contention and warm caches affect results. These measurements compare speed, not answer quality. The separate offline setup and model guidance explain expected download and memory costs.
 
 ## Online Assist
 
-Local models stay private and offline. **Online Assist** is the one opt-in remote path:
-the active conversation goes to the FreeLLM-compatible service you configure. Keep
-credentials out of the browser — set them as Firebase secrets:
+Selecting Online Assist sends the active prompt and any attached page excerpt to the configured service. There is no automatic fallback from local inference. Cloud replies currently arrive as a complete response; Stop cancels the browser request, and both client and proxy have timeouts.
 
-```bash
+```sh
 firebase functions:secrets:set FREELLM_API_URL
 firebase functions:secrets:set FREELLM_API_KEY
 firebase deploy --only functions,hosting
 ```
 
-For a self-hosted FreeLLMAPI instance, the URL is usually
-`https://your-host.example/v1/chat/completions`. The proxy uses its `auto:smart` route.
-Remote by design — don't use it for messages you want to keep entirely on-device.
+The proxy uses `auto:smart` unless `FREELLM_MODEL` is configured. Keep API credentials in Firebase secrets.
 
-## Important
+## Validation and release
 
-WebLLM weights persist in IndexedDB. **Bonsai weights are never cached by the app** — they stream
-straight to the GPU (see [Why weights are never cached](#why-weights-are-never-cached)). A file-based
-load needs nothing else from the network: the tokenizer ships **with the app** at `/tokenizer/` and is
-precached by the service worker, while the manifest and aux are parsed straight out of the GGUF you
-picked. So **"Load from a file…" works in airplane mode** by construction. Manifest and aux still use
-the Cache API for the download path, a one-shot `navigator.storage.persist()` reduces eviction odds,
-and the service worker ignores cross-origin fetches and never deletes `pocket-ai-meta-*`, so a shell
-update can't wipe what it holds.
+```sh
+npm run check
+```
 
-Switching models after one is loaded reloads the PWA so the WebGPU runtime is cleanly
-recreated — except after "Load from a file…", where the picked file can't outlive a
-reload, so that path disposes the old engine and starts the new one in-session instead.
+The gate checks syntax, prompt budgets, offline installation/failure behavior and the production build. With Chromium installed, it also verifies manifest/icons, cold offline reload, lazy runtime imports, both tokenizer configurations, page attachment persistence, history search, and edit/retry/stop using simulated cloud responses. It never sends a real AI API request or downloads model weights.
 
-## Why weights are never cached
+The Chromium probe does not establish real iPhone GPU compatibility. Before release, follow [the iPhone acceptance checklist](docs/IPHONE-ACCEPTANCE.md) with actual GGUF files. Production deployment remains `npm run build && firebase deploy`; existing GitHub workflows deploy pushes to main.
 
-The short version: **caching the weights in the Cache API was itself the bug.** 4B kept
-crashing the tab while 8B — the *bigger* model — loaded fine every time, which ruled out
-GPU memory and pointed at the one thing the two didn't share.
-
-| Model | GGUF | Under the old 640 MB cap? | Result |
-| --- | --- | --- | --- |
-| 1.7B | 237 MiB | yes → `cache.put()` | stalled, then locked the UI |
-| **4B** | **546 MiB** | **yes → `cache.put()`** | **tab killed** |
-| 8B | 1105 MiB | no → streamed | worked, every time |
-
-The old build capped `pocket-ai-models-v1` at 640 MB, so 1.7B and 4B were written into the
-Cache API and 8B was not. iOS Safari materializes a `cache.put()` body **inside the tab's
-page process**, so the only two models that ever ran that code path were the only two that
-failed — and the failure scaled with body size: 237 MiB was survivable, 546 MiB was not. The
-`"done"` marker, the truncation checks, and the per-model "Clear saved copy" chips all tried to
-make that write *safe*; none of them could make it *small*.
-
-So the write is gone. Weights go network → GPU with nothing in between, which is the same
-path 8B always took. Offline is the file's job: **Save to Files** puts the GGUF on the device
-via Safari's resumable download, and **Load from a file…** streams it from there. One-shot
-cleanup deletes any `pocket-ai-models-*` cache left by an older build.
-
-### The tokenizer is bundled, not cached
-
-Offline file-loads originally leaned on the Cache API for the tokenizer too, and that
-failed in practice: the write was fire-and-forget with its error swallowed
-(`.catch(() => {})`) and its result never verified, so a dropped or evicted 8.7 MB copy
-left a cache that *looked* healthy while every airplane-mode load died with no useful clue.
-
-So it no longer depends on the Cache API at all. 1.7B, 4B and 8B share one byte-identical
-`Qwen2Tokenizer` (md5 `415df598feeb7a2dc86e8d009284dc94`, 8.7 MB raw / ~1.9 MB gzipped),
-shipped once at `public/tokenizer/` and precached by the service worker — same-origin, so
-it's the one storage path we fully control. **27B is excluded on purpose**: it's a
-`qwen3_5` hybrid with a 248k vocab rather than 151k, so it keeps its own remote tokenizer.
-
-The service worker also no longer uses `cache.addAll()` for precaching. That call rejects as
-a unit, which meant a single unreachable URL could abandon the entire install and leave the
-app with no service worker at all. Each entry is now added independently: a missing tokenizer
-degrades to no offline tokenizer, but a missing app shell still correctly fails the install.
-
-Chats are **durable on-device**: transcripts mirror into IndexedDB as you chat, so closing or
-reloading the tab never loses them (and the app reopens ready to go). Context windows are
-**token-accurate** (bitgpu's real tokenizer, not a character guess) and, for local chats under
-~64 MB of KV cache, the whole conversation snapshot is saved too — reopening resumes at high
-speed instead of re-prefilling everything. All of it stays on the phone; nothing is uploaded,
-and no index or transcript leaves the device.
+Tokenizer source and license information is recorded in [THIRD_PARTY.md](THIRD_PARTY.md).
 
 ## Version history
+
+### v0.7.0
+
+- Complete offline installation, including lazy runtime files and the 27B tokenizer; safe service-worker updates and visible readiness.
+- iPhone guidance, source/model labels, GPU-loss recovery, generation/load cancellation improvements.
+- Searchable history, edit/resend, retry, local page text and saved HTML/text input, optional direct URL fetching.
+- Per-model context windows, visible excerpt trimming, durable transcript protection, and per-device speed measurements.
+- Deferred WebLLM import reduces initial UI parsing; unchanged chats are no longer rewritten to IndexedDB on every save.
+- Offline and chat-interaction regression checks.
+
+Entries below describe historical behavior, including policies that v0.7.0 replaces.
 
 ### v0.6.0
 

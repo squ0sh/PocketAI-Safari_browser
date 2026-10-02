@@ -8,8 +8,9 @@ const freeLlmApiKey = defineSecret("FREELLM_API_KEY");
 function validMessages(value) {
   if (!Array.isArray(value)) return [];
 
-  return value
-    .slice(-16)
+  const system = value[0]?.role === "system" ? [value[0]] : [];
+  const tail = value.slice(system.length).filter((message) => message?.role !== "system").slice(-15);
+  return [...system, ...tail]
     .filter(
       (message) =>
         message &&
@@ -44,6 +45,7 @@ export const onlineAssist = onRequest(
     try {
       const upstream = await fetch(freeLlmApiUrl.value(), {
         method: "POST",
+        signal: AbortSignal.timeout(55_000),
         headers: {
           Authorization: `Bearer ${freeLlmApiKey.value()}`,
           "Content-Type": "application/json",

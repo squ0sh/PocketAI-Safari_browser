@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, statSync, createReadStream, rmSync } from "node:fs";
+import { existsSync, statSync, createReadStream, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createServer as netCreateServer } from "node:net";
 import { join, dirname } from "node:path";
@@ -67,7 +67,9 @@ const waitFor = async (fn, tries = 80, gap = 250) => {
 };
 
 // 1. Syntax-check the two production scripts.
-for (const file of ["src/main.js", "functions/index.js"]) run("node", ["--check", file]);
+for (const file of ["src/main.js", "src/context.js", "src/offline.js", "public/sw.js", "functions/index.js"]) run("node", ["--check", file]);
+
+run("node", ["--test", "tools/context.test.mjs", "tools/offline.test.mjs"]);
 
 // 2. Production build.
 run("npx", ["vite", "build"]);
@@ -178,6 +180,81 @@ if (!chrome) {
             await sleep(600);
             const errors = await ev("window.__bootErrors.join(' | ')");
             if (errors) failures.push(`probe: boot errors — ${errors.slice(0, 400)}`);
+            const offlineReady = await ev(`new Promise(resolve => {
+              const start = Date.now();
+              const poll = () => {
+                if (document.querySelector('#connectionLabel').textContent.includes('App ready for offline GGUF')) return resolve(true);
+                if (Date.now() - start > 45000) return resolve(false);
+                setTimeout(poll, 250);
+              }; poll();
+            })`, true);
+            if (!offlineReady) failures.push("offline: complete app installation never became ready");
+            if (offlineReady) {
+              await tab("Network.enable");
+              await tab("Network.emulateNetworkConditions", { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 });
+              await tab("Page.reload");
+              const reloaded = await waitFor(() => ev("document.querySelectorAll('.model-option').length > 0"));
+              if (!reloaded) failures.push("offline: app did not reopen without a network");
+              else {
+                const chunks = await ev(`(async () => {
+                  const names = (await caches.keys()).filter(key => key.startsWith('pocket-ai-shell-'));
+                  const cache = await caches.open(names[0]);
+                  const paths = (await cache.keys()).map(r => new URL(r.url).pathname);
+                  const scripts = paths.filter(path => path.endsWith('.js'));
+                  await Promise.all(scripts.map(path => import(path)));
+                  const small = await fetch('/tokenizer/tokenizer_config.json').then(r => r.json());
+                  const large = await fetch('/tokenizer-27b/tokenizer_config.json').then(r => r.json());
+                  return scripts.length > 2 && !!small.tokenizer_class && !!large.tokenizer_class;
+                })()`, true);
+                if (!chunks) failures.push("offline: runtime chunks or tokenizer configurations unavailable");
+                await ev(`document.querySelector('#pageButton').click(); document.querySelector('#pageTitle').value = 'Offline reference'; document.querySelector('#pageText').value = 'Rain comes from condensed water.'; document.querySelector('#attachPage').click();`);
+                const attached = await ev("document.querySelector('#sourceBadge').textContent.includes('Offline reference')");
+                if (!attached) failures.push("offline: page text could not be attached");
+                await ev(`document.querySelector('#historySearch').value = 'Offline reference'; document.querySelector('#historySearch').dispatchEvent(new Event('input'));`);
+                if (await ev("document.querySelectorAll('.history-item').length") !== 1) failures.push("history: search did not isolate attached-page chat");
+                await tab("Page.reload");
+                await waitFor(() => ev("document.querySelectorAll('.model-option').length > 0"));
+                const persisted = await waitFor(() => ev("document.querySelector('#historyList').textContent.includes('Offline reference')"));
+                if (!persisted) failures.push("offline: page chat was lost across reload");
+                console.log("  offline: cold reopen, lazy runtimes, both tokenizer families, page attachment and history persistence");
+              }
+              await tab("Network.emulateNetworkConditions", { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+            }
+            // Exercise persisted chat actions with a fake cloud response, never a real API call.
+            await ev(`window.__requests = []; window.__delayReply = false; window.__nativeFetch = fetch;
+              window.fetch = (url, options = {}) => {
+                if (url !== '/api/online-assist') return window.__nativeFetch(url, options);
+                const payload = JSON.parse(options.body); window.__requests.push(payload);
+                if (window.__delayReply) return new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(new DOMException('Stopped', 'AbortError')), { once: true }));
+                return Promise.resolve(new Response(JSON.stringify({ content: 'Answer to: ' + payload.messages.at(-1).content }), { headers: { 'Content-Type': 'application/json' } }));
+              };
+              document.querySelector('#modelButton').click();
+              [...document.querySelectorAll('.model-option')].find(el => el.textContent.includes('Online Assist')).click();
+              document.querySelector('#loadButton').click();`);
+            await waitFor(() => ev("!document.querySelector('#input').disabled"));
+            await ev(`document.querySelector('#input').value = 'First question'; document.querySelector('#composer').requestSubmit();`);
+            await waitFor(() => ev("document.querySelector('.message.assistant')?.textContent.includes('Answer to: First question')"));
+            const sourceSent = await ev("window.__requests.at(-1)?.messages[0].content.includes('Rain comes from condensed water.')");
+            if (!sourceSent) failures.push("page help: source was omitted from the explicitly selected online request");
+            await ev(`document.querySelector('.message.user .message-actions button').click(); document.querySelector('#input').value = 'Edited question'; document.querySelector('#composer').requestSubmit();`);
+            const edited = await waitFor(() => ev("document.querySelector('.message.assistant')?.textContent.includes('Answer to: Edited question')"));
+            if (!edited || await ev("document.querySelectorAll('.message').length") !== 2) failures.push("chat edit: reply was not replaced cleanly");
+            await ev("document.querySelector('.message.assistant .message-actions button').click()");
+            await waitFor(() => ev("window.__requests.length === 3 && !document.querySelector('#input').disabled"));
+            if (await ev("document.querySelectorAll('.message').length") !== 2) failures.push("retry: duplicated conversation turns");
+            await ev(`window.__delayReply = true; document.querySelector('#input').value = 'Stop this reply'; document.querySelector('#composer').requestSubmit();`);
+            await waitFor(() => ev("window.__requests.length === 4"));
+            await ev("document.querySelector('#send').click()");
+            const stopped = await waitFor(() => ev("!document.querySelector('#input').disabled && document.querySelector('#chat').textContent.includes('(stopped)')"));
+            if (!stopped) failures.push("stop: online cancellation did not release the composer");
+            const lateErrors = await ev("window.__bootErrors.join(' | ')");
+            if (lateErrors) failures.push("interaction errors: " + lateErrors);
+            console.log("  chat: page context, edit/resend, retry and stop (mock online responses)");
+            if (process.env.POCKET_SCREENSHOTS) {
+              await tab("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+              const shot = await tab("Page.captureScreenshot", { format: "png" });
+              writeFileSync(join(tmpdir(), "pocket-ai-mobile.png"), Buffer.from(shot.data, "base64"));
+            }
             const tiles = await ev(` [...new Set([...document.querySelectorAll('.model-option')].map(b => b.textContent.trim()))].join(', ') `);
             const hist = await ev("document.querySelectorAll('.history-item').length");
             if (!(hist >= 1)) failures.push("probe: history drawer rendered no rows");

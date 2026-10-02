@@ -1,66 +1,56 @@
-const CACHE = "pocket-ai-shell-v0.6.0";
-const SHELL = ["/", "/index.html", "/manifest.webmanifest", "/icon.svg", "/icon-180.png", "/icon-192.png", "/icon-512.png"];
-
-// Bundled Qwen2Tokenizer (~8.7 MB raw, ~1.9 MB gzipped) so loading a model from a
-// local file needs no network. Precached here so offline loading does not depend
-// on a runtime cache write having landed earlier.
-const TOKENIZER = ["/tokenizer/tokenizer.json", "/tokenizer/tokenizer_config.json"];
-
-// cache.addAll rejects as a unit, so one unreachable URL would abandon the whole
-// install and leave the app with no service worker at all. Add each entry
-// independently and only fail the install if the app shell itself is missing.
-self.addEventListener("install", (event) =>
-  event.waitUntil(
-    caches.open(CACHE).then(async (cache) => {
-      const critical = [...SHELL];
-      const results = await Promise.allSettled(
-        [...critical, ...TOKENIZER].map((url) => cache.add(url))
-      );
-      critical.forEach((url, i) => {
-        if (results[i].status === "rejected") {
-          throw results[i].reason;
-        }
-      });
-      results.slice(critical.length).forEach((result, i) => {
-        if (result.status === "rejected") {
-          console.warn("[sw] tokenizer precache failed:", TOKENIZER[i], result.reason);
-        }
-      });
-    })
-  )
-);
-
-self.addEventListener("activate", (event) =>
-  event.waitUntil(
-    caches
-      .keys()
-      .then((keys) =>
-        Promise.all(
-          keys
-            .filter(
-              (key) =>
-                key !== CACHE &&
-                !key.startsWith("pocket-ai-models-") &&
-                !key.startsWith("pocket-ai-meta-")
-            )
-            .map((key) => caches.delete(key))
-        )
-      )
-      .then(() => self.clients.claim())
-  )
-);
-
+// The production build injects every runtime chunk, stylesheet and public asset.
+const BUILD_ASSETS = []; // @build-assets
+const CACHE = "pocket-ai-shell-__BUILD_ID__";
+async function saveAsset(cache, path) {
+  const response = await fetch(new Request(path, { cache: "reload" }));
+  const type = response.headers.get("content-type") || "";
+  const expected = path.endsWith(".js") ? /javascript/ : path.endsWith(".css") ? /text\/css/ : /\.(json|webmanifest)$/.test(path) ? /json/ : path.endsWith(".html") ? /text\/html/ : null;
+  if (!response.ok || (expected && !expected.test(type))) throw new Error(`Unable to save ${path}`);
+  await cache.put(path, response);
+}
+async function cacheStatus(cache) {
+  const saved = new Set((await cache.keys()).map((r) => new URL(r.url).pathname));
+  const missing = BUILD_ASSETS.filter((path) => !saved.has(path));
+  return { ready: BUILD_ASSETS.length > 0 && !missing.length, missing };
+}
+self.addEventListener("install", (event) => event.waitUntil((async () => {
+  if (!BUILD_ASSETS.length) throw new Error("Build the app before installing offline support.");
+  const cache = await caches.open(CACHE);
+  const results = await Promise.allSettled(BUILD_ASSETS.map((path) => saveAsset(cache, path)));
+  if (results.some((r) => r.status === "rejected")) {
+    await caches.delete(CACHE);
+    throw new Error("Offline installation incomplete. Reconnect and try again.");
+  }
+})()));
+self.addEventListener("activate", (event) => event.waitUntil((async () => {
+  for (const key of await caches.keys()) {
+    if (key.startsWith("pocket-ai-shell-") && key !== CACHE) await caches.delete(key);
+  }
+  await self.clients.claim();
+})()));
+self.addEventListener("message", (event) => {
+  if (event.data?.type === "SKIP_WAITING") self.skipWaiting();
+  if (event.data?.type === "OFFLINE_STATUS") event.waitUntil((async () => {
+    const cache = await caches.open(CACHE);
+    event.ports[0]?.postMessage(await cacheStatus(cache));
+  })());
+  if (event.data?.type === "REPAIR_OFFLINE") event.waitUntil((async () => {
+    const cache = await caches.open(CACHE);
+    const { missing } = await cacheStatus(cache);
+    await Promise.allSettled(missing.map((path) => saveAsset(cache, path)));
+    event.ports[0]?.postMessage(await cacheStatus(cache));
+  })());
+});
 self.addEventListener("fetch", (event) => {
-  if (event.request.method !== "GET") return;
-  if (!event.request.url.startsWith(self.location.origin)) return;
-
-  event.respondWith(
-    fetch(event.request)
-      .then((response) => {
-        const cached = response.clone();
-        caches.open(CACHE).then((cache) => cache.put(event.request, cached)).catch(() => {});
-        return response;
-      })
-      .catch(() => caches.match(event.request))
-  );
+  const url = new URL(event.request.url);
+  if (event.request.method !== "GET" || url.origin !== self.location.origin || url.pathname.startsWith("/api/")) return;
+  event.respondWith((async () => {
+    const cache = await caches.open(CACHE);
+    const key = event.request.mode === "navigate" ? "/index.html" : url.pathname;
+    if (BUILD_ASSETS.includes(key)) {
+      const saved = await cache.match(key);
+      if (saved) return saved;
+    }
+    return fetch(event.request);
+  })());
 });
