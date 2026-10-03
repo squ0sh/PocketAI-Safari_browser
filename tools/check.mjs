@@ -20,9 +20,14 @@ function run(cmd, args, opts = {}) {
 }
 
 function chromiumName() {
-  for (const name of ["chromium", "chromium-browser", "google-chrome", "chrome"]) {
+  // Hosted Ubuntu runners can expose a Chromium snap launcher that cannot run.
+  // Prefer the installed Chrome binary and verify each candidate can launch.
+  for (const name of ["google-chrome", "google-chrome-stable", "chrome", "chromium", "chromium-browser"]) {
     const res = spawnSync("which", [name], { encoding: "utf8" });
-    if (res.status === 0 && res.stdout.trim()) return res.stdout.trim();
+    if (res.status === 0 && res.stdout.trim()) {
+      const version = spawnSync(res.stdout.trim(), ["--version"], { encoding: "utf8", timeout: 10000 });
+      if (version.status === 0) return res.stdout.trim();
+    }
   }
   for (const p of ["/usr/bin/chromium", "/usr/lib/chromium/chromium", "/usr/bin/google-chrome"]) {
     if (existsSync(p)) return p;
@@ -127,9 +132,12 @@ if (!chrome) {
     const cdpPort = await freePort();
     const profile = mkdtempSync(join(tmpdir(), "pa-probe-chrome-"));
     const browser = spawn(chrome, [
-      "--headless=new", "--no-sandbox", "--no-first-run", "--no-default-browser-check",
+      "--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check",
       `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${profile}`, "about:blank",
-    ], { stdio: ["ignore", "ignore", "ignore"] });
+    ], { stdio: ["ignore", "ignore", "pipe"] });
+    let browserError = "";
+    browser.stderr.on("data", chunk => { browserError = (browserError + chunk).slice(-3000); });
+    browser.on("error", error => { browserError += error.message; });
 
     const cleanup = () => {
       try { browser.kill("SIGKILL"); } catch {}
@@ -141,7 +149,7 @@ if (!chrome) {
     try {
       const version = await waitFor(() => fetch(`http://127.0.0.1:${cdpPort}/json/version`).then((r) => r.json()).catch(() => null), 60, 250);
       if (!version) {
-        failures.push("probe: chromium did not expose CDP in time");
+        failures.push("probe: browser did not expose CDP in time: " + browserError);
         cleanup();
       } else {
         const ws = new WebSocket(version.webSocketDebuggerUrl);
