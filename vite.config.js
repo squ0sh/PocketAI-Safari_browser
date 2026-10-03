@@ -1,3 +1,4 @@
+import { manualPlugin } from "./tools/manual.mjs";
 import { defineConfig } from "vite";
 import basicSsl from "@vitejs/plugin-basic-ssl";
 import { createHash } from "node:crypto";
@@ -26,7 +27,7 @@ function offlineBundle() {
   };
 }
 export default defineConfig({
-  plugins:[offlineBundle(), {...basicSsl({name:"pocket-ai-local",domains:["10.0.0.103","localhost","127.0.0.1"],ttlDays:30}),apply:"serve"}],
+  plugins:[manualPlugin(), offlineBundle(), {...basicSsl({name:"pocket-ai-local",domains:["10.0.0.103","localhost","127.0.0.1"],ttlDays:30}),apply:"serve"}],
   server:{host:"0.0.0.0",port:5173,strictPort:true},
   preview:{host:"0.0.0.0",port:5173,strictPort:true}
 });

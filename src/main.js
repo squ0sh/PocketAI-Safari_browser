@@ -1,4 +1,5 @@
 import "./style.css";
+import userManualHtml from "virtual:user-manual";
 import { PERFORMANCE_KEY, JOURNAL_KEY, median, profileFor, configFor, readMeasurements, recordMeasurement, recommendation, measureRuns } from "./performance.js";
 import { SYSTEM_PROMPT, preparePrompt } from "./context.js";
 import { offlineStatus, updateOfflineApp } from "./offline.js";
@@ -431,7 +432,17 @@ function render() {
   if (!welcome.hidden) chat.append(welcome);
   const sourceBadge = $("#sourceBadge");
   sourceBadge.hidden = !c?.source;
-  sourceBadge.textContent = c?.source ? `Reference: ${c.source.title} · ${c.source.text.length.toLocaleString()} characters · Page help to view` : "";
+  sourceBadge.replaceChildren();
+  if (c?.source) {
+    const title = document.createElement("span");
+    title.textContent = `Attached: ${c.source.title} · ${c.source.text.length.toLocaleString()} characters`;
+    const view = document.createElement("button");
+    view.type = "button"; view.textContent = "View attached text";
+    view.onclick = () => $("#pageButton").click();
+    sourceBadge.append(title, view);
+  }
+  $("#textSuggestions").hidden = !c?.source;
+  $("#textSuggestions").querySelectorAll("button").forEach(button => { button.disabled = busy || hydrating || editingIndex !== null; });
   c?.messages.forEach((message, index) => {
     const bubble = addBubble(message.role, message.content);
     if (message.role === "assistant" && message.model) {
@@ -868,6 +879,7 @@ async function loadModel() {
 
   load.disabled = true;
   errorBox.hidden = true;
+  $("#loadErrorDetails").hidden = true;
 
   progressWrap.hidden = false;
   cancelLoadButton.hidden = false;
@@ -1041,7 +1053,12 @@ if (e === ABORTED || !alive()) return;
     chatEngine = null;
     engineRuntime = null;
     kvReady = null;
-    notifyUser(e?.message || "Could not load this model. Try a smaller model or reselect the GGUF file.");
+    const reason = String(e?.message || "");
+    notifyUser(isOnlineModel(m)
+      ? "The online model could not connect. Check your internet connection and service configuration, then retry. Technical details are below."
+      : /memory|buffer|allocation/i.test(reason)
+      ? "This model needs more memory than the browser could provide. Choose a smaller model from the model menu. Technical details are below."
+      : "The model could not load. Check Offline setup or reselect its saved file, then retry. Technical details are below.");
     cancelLoadButton.hidden = true;
 
 
@@ -1060,7 +1077,8 @@ if (e === ABORTED || !alive()) return;
       `Runtime: ${m.runtime}\n` +
       `Browser: ${navigator.userAgent}`;
 
-    errorBox.hidden = false;
+    errorBox.hidden = false;
+    $("#loadErrorDetails").hidden = false;
 
     console.error(
       "Pocket AI initialization error",
@@ -1599,6 +1617,7 @@ function offerContinue(c, bubble, partial, count) {
       chip.disabled = false;
       errorBox.textContent = "Continuation failed.\n\n" + formatError(e);
       errorBox.hidden = false;
+    $("#loadErrorDetails").hidden = false;
       notifyUser("Continuation failed. " + e.message);
     } finally {
       setGenerating(false);
@@ -1719,6 +1738,7 @@ async function onFilePicked(file) {
     errorBox.textContent =
       "That file doesn't look like a Bonsai GGUF. Pick a Bonsai-*.gguf.";
     errorBox.hidden = false;
+    $("#loadErrorDetails").hidden = false;
     notifyUser(errorBox.textContent);
     return;
   }
@@ -1828,7 +1848,7 @@ render();
 renderHistory();
 
 // Merge the durable (tab-close-proof) copy of the chats in the background.
-hydrateChatsFromIDB().finally(() => { hydrating = false; });
+hydrateChatsFromIDB().finally(() => { hydrating = false; render(); });
 
 if ("serviceWorker" in navigator && import.meta.env.PROD) {
   navigator.serviceWorker.addEventListener("controllerchange", refreshConnection);
@@ -1917,9 +1937,11 @@ async function refreshConnection() {
   // Use the current selection after the async status request finishes.
   const mode = isOnlineModel() ? `${model().name} · chat and page sent to your service` : "On-device mode · chat stays here";
   label.textContent = mode + (navigator.onLine ? "" : " · no internet") + (result.ready ? " · App ready for offline GGUF" : result.pending ? " · Preparing offline setup…" : " · Offline setup incomplete");
+  $("#offlineErrorDetails").hidden = result.ready || result.pending || !result.missing?.length;
+  $("#offlineError").textContent = (result.missing || []).join(" · ");
   $("#offlineDetail").textContent = result.ready
     ? "App, runtime and tokenizers are saved. You still need a compatible GGUF downloaded onto this device in Files."
-    : (result.missing || []).join(" · ");
+    : result.pending ? "Saving app support files… Keep this page open online." : "App support files need attention. Connect to the internet and tap Repair offline setup.";
 }
 
 function pageTextFromHtml(html) {
@@ -1944,7 +1966,11 @@ $("#refreshOffline").onclick = async () => {
   try {
     const updating = await updateOfflineApp();
     if (!updating) await refreshConnection();
-  } catch (error) { $("#offlineDetail").textContent = error.message; }
+  } catch (error) {
+    $("#offlineDetail").textContent = "Setup could not finish. Check your connection and try Repair again.";
+    $("#offlineErrorDetails").hidden = false;
+    $("#offlineError").textContent = error.message;
+  }
   finally { button.disabled = false; }
 };
 $("#pageButton").onclick = () => {
@@ -1954,12 +1980,16 @@ $("#pageButton").onclick = () => {
   $("#pageText").value = source?.text || "";
   $("#pageUrl").value = source?.url || "";
   $("#pageError").textContent = "";
+  $("#pagePrivacy").textContent = isOnlineModel()
+    ? `${model().name}: sending a question uploads relevant chat and attached text to your configured service.`
+    : "Local mode: your question and attached text stay on this device. Saved text works offline after setup.";
   $("#pageDialog").showModal();
 };
 $("#pageFile").onchange = async (event) => {
   const file = event.target.files?.[0];
   if (!file) return;
   try {
+    if (!/\.(txt|md|html?|htm)$/i.test(file.name)) throw new Error("Choose a text, Markdown or HTML file. Copy and paste text from PDFs or images instead.");
     if (file.size > 2 * 1024 * 1024) throw new Error("Choose a text or HTML file under 2 MB.");
     const body = await file.text();
     const page = /\.html?$/i.test(file.name) ? pageTextFromHtml(body) : { title: file.name, text: body };
@@ -2020,7 +2050,7 @@ $("#attachPage").onclick = () => {
   save(); render();
   $("#pageDialog").close();
   input.value = "Summarize the main points of this page.";
-  notifyUser(engine ? "Page attached to a new chat. Send the suggested question or write your own." : "Page attached. Load a local model to ask about it offline.");
+  notifyUser(engine ? "Text attached to a new chat. Choose a suggestion or write a question, then tap Send." : "Text attached. Load a model, then choose a suggestion or write a question and tap Send.");
   input.focus();
 };
 
@@ -2152,4 +2182,34 @@ if (interruptedLoad) {
   const reason = `The previous model load stopped during ${interruptedLoad.phase || "loading"}. This can follow a reload or tab interruption; it does not prove a memory failure.`;
   if (interruptedLoad.model === "Bonsai-27B-bitgpu") offer27B(reason);
   else notifyUser(reason);
+}
+
+// This HTML is compiled from the repository manual, never from attached text.
+$("#guideContent").innerHTML = userManualHtml;
+for (const id of ["#welcomeHelp", "#drawerHelp"]) $(id).onclick = () => $("#guideDialog").showModal();
+$("#guideContent").addEventListener("click", event => {
+  const link = event.target.closest('a[href^="#guide-"]');
+  if (!link) return;
+  event.preventDefault();
+  const target = document.getElementById(link.getAttribute("href").slice(1));
+  target?.scrollIntoView({ block: "start" });
+  target?.focus({ preventScroll: true });
+});
+$("#offlineModels").onclick = () => { $("#setupDialog").close(); modelButton.click(); };
+$("#textSuggestions").addEventListener("click", event => {
+  const button = event.target.closest("button[data-question]");
+  if (!button || busy || hydrating || editingIndex !== null) return;
+  input.value = button.dataset.question;
+  if (engine) input.focus();
+  else notifyUser("Question prepared. Load a model, then tap Send.");
+});
+// Native dialogs keep keyboard focus inside and restore it to their opener.
+for (const dialog of document.querySelectorAll("dialog")) {
+  let opener;
+  const show = dialog.showModal.bind(dialog);
+  dialog.showModal = () => { opener = document.activeElement; show(); };
+  dialog.addEventListener("close", () => {
+    const target = opener?.isConnected ? opener : !input.disabled ? input : $("#loadTools");
+    target?.focus({ preventScroll: true });
+  });
 }

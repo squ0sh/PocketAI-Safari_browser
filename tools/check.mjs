@@ -69,7 +69,7 @@ const waitFor = async (fn, tries = 80, gap = 250) => {
 // 1. Syntax-check the two production scripts.
 for (const file of ["src/main.js", "src/context.js", "src/offline.js", "public/sw.js", "functions/index.js"]) run("node", ["--check", file]);
 
-run("node", ["--test", "tools/context.test.mjs", "tools/offline.test.mjs"]);
+run("node", ["--test", "tools/context.test.mjs", "tools/offline.test.mjs", "tools/manual.test.mjs"]);
 
 // 2. Production build.
 run("npx", ["vite", "build"]);
@@ -210,9 +210,57 @@ if (!chrome) {
                   return scripts.length > 2 && !!small.tokenizer_class && !!large.tokenizer_class;
                 })()`, true);
                 if (!chunks) failures.push("offline: runtime chunks or tokenizer configurations unavailable");
+                await tab("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+                const guideWorks = await ev(`(() => {
+                  document.querySelector('#welcomeHelp').focus(); document.querySelector('#welcomeHelp').click();
+                  const guide = document.querySelector('#guideDialog');
+                  const link = document.querySelector('#guideContent a[href="#guide-ask-about-text"]');
+                  link.click();
+                  const ok = guide.open && document.activeElement.id === 'guide-ask-about-text' && guide.scrollWidth <= guide.clientWidth + 1;
+                  return ok;
+                })()`);
+                if (!guideWorks) failures.push("guide: offline contents navigation or phone layout failed");
+                if (process.env.POCKET_SCREENSHOTS) {
+                  await ev("document.querySelector('#guideDialog').scrollTop = 0");
+                  const shot = await tab("Page.captureScreenshot", { format: "png" });
+                  writeFileSync(join(tmpdir(), "pocket-ai-guide.png"), Buffer.from(shot.data, "base64"));
+                }
+                await tab("Input.dispatchKeyEvent", { type: "keyDown", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+                await tab("Input.dispatchKeyEvent", { type: "keyUp", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+                if (!await ev("document.querySelector('#guideDialog').contains(document.activeElement)")) failures.push("guide: Tab focus escaped the modal");
+                await tab("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+                await tab("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+                if (!await waitFor(() => ev("!document.querySelector('#guideDialog').open"))) failures.push("guide: Escape did not close the modal");
+                if (!await waitFor(() => ev("document.activeElement.id === 'welcomeHelp'"))) failures.push("guide: focus did not return to opener");
+                await ev("document.querySelector('#setupButton').click()");
+                if (process.env.POCKET_SCREENSHOTS) {
+                  const shot = await tab("Page.captureScreenshot", { format: "png" });
+                  writeFileSync(join(tmpdir(), "pocket-ai-setup.png"), Buffer.from(shot.data, "base64"));
+                }
+                await ev("document.querySelector('#setupDialog').close()");
+                await ev(`document.querySelector('#pageButton').click();
+                  const files = new DataTransfer(); files.items.add(new File(['<html><head><title>Saved article</title></head><body><article>Saved HTML text</article></body></html>'], 'article.html', {type:'text/html'}));
+                  document.querySelector('#pageFile').files = files.files; document.querySelector('#pageFile').dispatchEvent(new Event('change'));`);
+                if (!await waitFor(() => ev("document.querySelector('#pageText').value.includes('Saved HTML text')"))) failures.push("text: saved HTML was not extracted");
+                await ev(`document.querySelector('#pageText').value = 'x'.repeat(100001); document.querySelector('#attachPage').click()`);
+                if (!await ev("document.querySelector('#pageError').textContent.includes('100,000') && document.querySelector('#pageDialog').open")) failures.push("text: oversized attachment was accepted");
+                await tab("Emulation.setDeviceMetricsOverride", { width: 320, height: 740, deviceScaleFactor: 1, mobile: true });
+                if (!await ev("document.querySelector('#pageDialog').scrollWidth <= document.querySelector('#pageDialog').clientWidth + 1")) failures.push("text: attachment panel overflows narrow phone width");
+                if (process.env.POCKET_SCREENSHOTS) {
+                  await ev("document.querySelector('#pageText').value = 'Rain comes from condensed water.'; document.querySelector('#pageError').textContent = ''; document.querySelector('#pageDialog').scrollTop = 0");
+                  const shot = await tab("Page.captureScreenshot", { format: "png" });
+                  writeFileSync(join(tmpdir(), "pocket-ai-text.png"), Buffer.from(shot.data, "base64"));
+                }
+                await ev("document.querySelector('#pageDialog').close()");
+
                 await ev(`document.querySelector('#pageButton').click(); document.querySelector('#pageTitle').value = 'Offline reference'; document.querySelector('#pageText').value = 'Rain comes from condensed water.'; document.querySelector('#attachPage').click();`);
                 const attached = await ev("document.querySelector('#sourceBadge').textContent.includes('Offline reference')");
                 if (!attached) failures.push("offline: page text could not be attached");
+                await ev("document.querySelector('#textSuggestions button:nth-of-type(2)').click()");
+                if (!await ev("document.querySelector('#input').value === 'Explain this text in simple language.' && document.querySelectorAll('.message').length === 0")) failures.push("text: suggestion did not prepare an unsent question");
+                await ev("document.querySelector('#sourceBadge button').click()");
+                if (!await ev("document.querySelector('#pageDialog').open && document.querySelector('#pageText').value.includes('Rain comes')")) failures.push("text: reference could not be viewed");
+                await ev("document.querySelector('#pageDialog').close()");
                 await ev(`document.querySelector('#historySearch').value = 'Offline reference'; document.querySelector('#historySearch').dispatchEvent(new Event('input'));`);
                 if (await ev("document.querySelectorAll('.history-item').length") !== 1) failures.push("history: search did not isolate attached-page chat");
                 await tab("Page.reload");
@@ -223,6 +271,9 @@ if (!chrome) {
               }
               await tab("Network.emulateNetworkConditions", { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
             }
+            await ev(`window.__beforeBlockedFetch = fetch; window.fetch = () => Promise.reject(new TypeError('Blocked by website')); document.querySelector('#pageButton').click(); document.querySelector('#pageUrl').value = 'https://example.com/article'; document.querySelector('#fetchPage').click();`);
+            if (!await waitFor(() => ev("document.querySelector('#pageError').textContent.includes('Copy its text')"))) failures.push("text: blocked URL did not explain paste fallback");
+            await ev("window.fetch = window.__beforeBlockedFetch; document.querySelector('#pageDialog').close()");
             // Exercise persisted chat actions with a fake cloud response, never a real API call.
             await ev(`window.__requests = []; window.__delayReply = false; window.__nativeFetch = fetch;
               window.fetch = (url, options = {}) => {
@@ -235,6 +286,8 @@ if (!chrome) {
               [...document.querySelectorAll('.model-option')].find(el => el.textContent.includes('Online Assist')).click();
               document.querySelector('#loadButton').click();`);
             await waitFor(() => ev("!document.querySelector('#input').disabled"));
+            await ev("document.querySelector('#textSuggestions button').click()");
+            if (!await ev("window.__requests.length === 0 && document.querySelector('#input').value.includes('Summarize')")) failures.push("text: suggestion sent an online request automatically");
             await ev(`document.querySelector('#input').value = 'First question'; document.querySelector('#composer').requestSubmit();`);
             await waitFor(() => ev("document.querySelector('.message.assistant')?.textContent.includes('Answer to: First question')"));
             const sourceSent = await ev("window.__requests.at(-1)?.messages[0].content.includes('Rain comes from condensed water.')");

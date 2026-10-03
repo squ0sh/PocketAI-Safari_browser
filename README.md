@@ -1,8 +1,12 @@
 # Pocket AI
 
-> Private on-device chat for iPhone Safari · v0.8.1
+> Private on-device chat for iPhone Safari · v0.8.2
 
 Pocket AI runs supported local models using WebGPU. Its Bonsai GGUF file path works offline after the app has finished installing its support files. Online Assist is a separate, explicit remote option.
+
+## User guide
+
+For everyday use, read the [Pocket AI user manual](USER-MANUAL-README.md). The same guide is available through **Help & user guide** in the app and works offline after setup. This README covers development, runtime details and deployment.
 
 ## Start here
 
@@ -44,11 +48,11 @@ Bonsai weights are streamed from Files or the network and are never written to C
 
 File loading supports the listed **Bonsai Q1_0 GGUF** releases, with their recognizable Bonsai filenames. It does not support arbitrary GGUF quantizations. Unknown filenames and incompatible architectures produce an error. There is no universally guaranteed iPhone model ceiling: available memory, context allocation, browser version and other apps all matter.
 
-## Chat and page help
+## Chat and text attachments
 
 - Local answers stream as they are generated. Stop preserves partial text. Retry regenerates an answer; Edit & resend replaces the edited turn and subsequent messages after you send.
 - History is stored in IndexedDB and is searchable by title or message. Export a Markdown transcript, including an attached reference, or delete a chat and its snapshots.
-- **Page help** accepts pasted text or a saved text/HTML file. Each attachment starts a new chat and is retained across reloads. HTML scripts are not inserted into the live page.
+- **Ask about text** accepts pasted text or a saved text/HTML file. Each attachment starts a new chat and is retained across reloads. HTML scripts are not inserted into the live page.
 - Local page questions work offline. The model receives a bounded excerpt, with a visible notice when the full source or older messages do not fit. Shorten the source to ask about a later section. This is page-context prompting, not a document search index.
 - **Fetch a URL online** is an explicit direct request to that website. Browser CORS restrictions may block it; paste text instead. It requires HTTPS and limits downloads to 2 MB. Page text is capped at 100,000 characters.
 - Context budgeting uses bitgpu's tokenizer and each model's configured window: 4K for 1.7B/4B, 8K for 8B, 2K for 27B. WebLLM uses a conservative text estimate. An oversized newest request is rejected, never silently discarded.
@@ -100,6 +104,13 @@ The Chromium probe does not establish real iPhone GPU compatibility. Before rele
 Tokenizer source and license information is recorded in [THIRD_PARTY.md](THIRD_PARTY.md).
 
 ## Version history
+
+### v0.8.2
+
+- Add a beginner user manual, also bundled as an offline in-app guide.
+- Rename Page help to Ask about text, clarify attachments and add question suggestions that never send automatically.
+- Guide offline setup through app files, saved models and an airplane-mode check; show original errors under Technical details.
+- Improve phone-sized controls, dialog focus and reference viewing.
 
 ### v0.8.1
 
