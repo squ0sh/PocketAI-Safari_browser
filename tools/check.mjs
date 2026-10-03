@@ -216,7 +216,9 @@ if (!chrome) {
                   const guide = document.querySelector('#guideDialog');
                   const link = document.querySelector('#guideContent a[href="#guide-ask-about-text"]');
                   link.click();
-                  const ok = guide.open && document.activeElement.id === 'guide-ask-about-text' && guide.scrollWidth <= guide.clientWidth + 1;
+                  const heading = document.getElementById('guide-ask-about-text');
+                  const header = guide.querySelector('form');
+                  const ok = guide.open && document.activeElement.id === 'guide-ask-about-text' && guide.scrollWidth <= guide.clientWidth + 1 && heading.getBoundingClientRect().top >= header.getBoundingClientRect().bottom;
                   return ok;
                 })()`);
                 if (!guideWorks) failures.push("guide: offline contents navigation or phone layout failed");

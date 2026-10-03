@@ -37,3 +37,4 @@ input:focus-visible,textarea:focus-visible{outline:2px solid #bcbcff;outline-off
 .topbar .brand h1{white-space:nowrap}
 #modelButton{max-width:44vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 @media(max-width:350px){.topbar{gap:6px;padding-left:10px;padding-right:10px}.topbar .brand h1{font-size:17px}#modelButton{max-width:40vw;padding-left:8px;padding-right:8px;font-size:12px}}
+#guideContent h1,#guideContent h2,#guideContent h3{scroll-margin-top:100px}
