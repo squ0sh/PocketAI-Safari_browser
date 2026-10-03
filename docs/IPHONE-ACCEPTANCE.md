@@ -14,3 +14,12 @@ Record the exact iPhone, iOS version, Safari or Home Screen mode, app version, m
 | Device / iOS | Mode | Model | Offline load + chat | Background recovery | Version / date |
 | --- | --- | --- | --- | --- | --- |
 | Awaiting physical-device validation | — | — | Not yet measured | Not yet measured | v0.7.0 |
+
+## Performance and 27B follow-up (iPhone 15 and newer)
+
+- Record one warm-up and three measured runs per model; check that medians exclude warm-up and that load counts reflect real loads. Cancel a benchmark and confirm it creates no result.
+- Compare model guidance only on the matching browser/GPU/runtime configuration. Repeat after a GPU interruption and successful reload.
+- Try 27B at its unchanged 2K context. Record exact load phase and allocation error. Reload during loading and inspect the unfinished-load message; do not treat it as proof of an out-of-memory crash.
+- Decline online fallback and verify no API request occurs. Check availability and verify it contains no chat or page content. Switch explicitly, then Send and verify the fixed `bonsai-27b` profile and online message label.
+- Check disabled, outdated and unavailable backends. None may substitute the generic cloud model. Return to a smaller local GGUF in airplane mode.
+- Physical iPhone performance and the real configured 27B provider route remain unmeasured.

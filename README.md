@@ -1,6 +1,6 @@
 # Pocket AI
 
-> Private on-device chat for iPhone Safari · v0.7.0
+> Private on-device chat for iPhone Safari · v0.8.0
 
 Pocket AI runs supported local models using WebGPU. Its Bonsai GGUF file path works offline after the app has finished installing its support files. Online Assist is a separate, explicit remote option.
 
@@ -57,13 +57,15 @@ Transcripts are authoritative. A compatible short-chat KV snapshot can accelerat
 
 ## Measure your device
 
-**Speed test** runs the same 128-token-budget prompt on the currently loaded local model. It records load time/source, time to first visible text, generated token count, generation speed, GPU information when available, and browser identity. It does not infer an iPhone model or available memory. Measurements stay on the device and can be cleared.
+**Speed test** runs one warm-up and three measured replies using the same prompt and 128-token budget. It saves the median time to first visible text and whole-reply tokens/second (including prompt processing). Warm-up is excluded. Load medians use actual successful model loads with the same source, rather than repeated generation runs. Interrupted or empty runs are not saved.
+
+Results are separated by browser, exposed GPU features/limits, model settings and runtime version. Model guidance requires successful load and reply evidence on the matching profile. Later load or GPU failures invalidate that guidance until a fresh successful load and reply. This is observed compatibility, not a memory guarantee. No phone model or RAM capacity is inferred. Measurements stay on this device and can be cleared. Older single-run measurements do not count toward the new comparison.
 
 Temperature, battery state, GPU contention and warm caches affect results. These measurements compare speed, not answer quality. The separate offline setup and model guidance explain expected download and memory costs.
 
 ## Online Assist
 
-Selecting Online Assist sends the active prompt and any attached page excerpt to the configured service. There is no automatic fallback from local inference. Cloud replies currently arrive as a complete response; Stop cancels the browser request, and both client and proxy have timeouts.
+Sending a message in Online Assist sends the active prompt and any attached page excerpt to the configured service. There is no automatic fallback from local inference. Cloud replies currently arrive as a complete response; Stop cancels the browser request, and both client and proxy have timeouts.
 
 ```sh
 firebase functions:secrets:set FREELLM_API_URL
@@ -71,7 +73,19 @@ firebase functions:secrets:set FREELLM_API_KEY
 firebase deploy --only functions,hosting
 ```
 
-The proxy uses `auto:smart` unless `FREELLM_MODEL` is configured. Keep API credentials in Firebase secrets.
+The generic proxy uses `auto:smart` unless `FREELLM_MODEL` is configured. Keep API credentials in Firebase secrets.
+
+### Optional Bonsai 27B online route
+
+Local 27B remains an experiment with a 2K context and q8 KV cache. Weight storage alone is about 3.8 GB; GPU buffer limits and working memory can prevent loading. Runtime memory errors retain their original allocation details. A session load journal reports unfinished loads after a reload or restored tab; it cannot prove that Safari killed the tab or recover a session Safari discarded.
+
+After a failed local 27B load, or through **27B online options**, the app offers a consent dialog. Nothing is uploaded automatically. **Check online availability** contacts the app server without chat content. **Use Bonsai 27B online** switches the session; only a subsequent Send submits the question, relevant history and page excerpt. Reopening returns to local 27B. All existing local GGUF features remain usable offline.
+
+To enable the option, set the Firebase string parameter `FREELLM_27B_MODEL` in the project's functions environment (`.env.<project-id>`) to the provider's exact Bonsai 27B model route, then deploy `onlineAssist`. The default empty value disables it; `auto:*` routes are rejected. The provider configured by `FREELLM_API_URL` must actually serve that checkpoint. Availability checks report configuration, not successful inference. No specific provider route has been verified by this change.
+
+The client sends the fixed profile `bonsai-27b`; the server chooses the configured model. An outdated backend or missing configuration cannot silently substitute generic Online Assist. Credentials and provider model identifiers are not returned by the capabilities endpoint.
+
+**Deployment:** the existing push workflow deploys Hosting only. Deploy the updated function separately with `firebase deploy --only functions:onlineAssist` before enabling this option. Hosting deployment alone does not install the new API handler.
 
 ## Validation and release
 
@@ -81,11 +95,18 @@ npm run check
 
 The gate checks syntax, prompt budgets, offline installation/failure behavior and the production build. With Chromium installed, it also verifies manifest/icons, cold offline reload, lazy runtime imports, both tokenizer configurations, page attachment persistence, history search, and edit/retry/stop using simulated cloud responses. It never sends a real AI API request or downloads model weights.
 
-The Chromium probe does not establish real iPhone GPU compatibility. Before release, follow [the iPhone acceptance checklist](docs/IPHONE-ACCEPTANCE.md) with actual GGUF files. Production deployment remains `npm run build && firebase deploy`; existing GitHub workflows deploy pushes to main.
+The Chromium probe does not establish real iPhone GPU compatibility. Before release, follow [the iPhone acceptance checklist](docs/IPHONE-ACCEPTANCE.md) with actual GGUF files. Production deployment remains `npm run build && firebase deploy`; the Firebase GitHub workflow deploys Hosting on pushes to main, while functions require a separate deployment.
 
 Tokenizer source and license information is recorded in [THIRD_PARTY.md](THIRD_PARTY.md).
 
 ## Version history
+
+### v0.8.0
+
+- Warm-up plus three-run local benchmarks, real load medians and evidence-based model guidance.
+- GPU/runtime profile separation, preserved allocation errors and unfinished-load session recovery.
+- Explicit-consent Bonsai 27B online profile, disabled until the backend route is configured.
+- Local offline mode and local 27B's 2K context remain available.
 
 ### v0.7.0
 
