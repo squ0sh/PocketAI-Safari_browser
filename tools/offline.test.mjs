@@ -23,18 +23,18 @@ function worker({ fail = false } = {}) {
     .replace('__BUILD_ID__', 'test');
   vm.runInNewContext(source, {
     self: { location: { origin }, clients: { claim: async () => {} }, addEventListener: (name, fn) => handlers[name] = fn, skipWaiting() {} },
-    caches, URL, Error, Request: class extends Request { constructor(path, opts) { super(new URL(path, origin), opts); } },
+    caches, URL, Error, Response, Headers, Request: class extends Request { constructor(path, opts) { super(new URL(path, origin), opts); } },
     fetch: async (request) => { requests++; if (!network || (fail && key(request).includes('tokenizer'))) throw new Error('offline'); return new Response('saved bytes', { headers: { 'Content-Type': key(request).endsWith('.js') ? 'text/javascript' : key(request).endsWith('.json') ? 'application/json' : 'text/html' } }); },
   });
   const lifecycle = async (type) => { let pending; handlers[type]({ waitUntil: (p) => pending = p }); return pending; };
-  return { stores, handlers, lifecycle, offline() { network = false; }, requests: () => requests };
+  return { stores, handlers, lifecycle, offline() { network = false; }, restore() { network = true; fail = false; }, requests: () => requests };
 }
 
-test('failed installation keeps the existing app and removes partial cache', async () => {
+test('failed installation keeps the existing app and completed downloads for repair', async () => {
   const w = worker({ fail: true });
   await assert.rejects(w.lifecycle('install'), /incomplete/);
   assert.ok(w.stores.has('pocket-ai-shell-old'));
-  assert.ok(!w.stores.has('pocket-ai-shell-test'));
+  assert.ok(w.stores.get('pocket-ai-shell-test').has('https://pocket.test/assets/runtime.js'));
 });
 test('offline navigation, runtime and 27B tokenizer use no network', async () => {
   const w = worker();
@@ -70,4 +70,15 @@ test('explicit repair restores evicted support files without wiping existing dat
   await pending;
   assert.equal(result.ready, true);
   assert.ok(w.stores.has('pocket-ai-meta-v1'));
+});
+
+test('retry resumes an interrupted install using completed files', async () => {
+  const w = worker({ fail: true });
+  await assert.rejects(w.lifecycle('install'), /incomplete/);
+  const before = w.requests();
+  w.restore();
+  await w.lifecycle('install');
+  assert.equal(w.requests() - before, 1, 'only the missing tokenizer is fetched');
+  await w.lifecycle('activate');
+  assert.ok(w.stores.has('pocket-ai-shell-test'));
 });

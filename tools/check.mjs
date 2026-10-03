@@ -188,7 +188,10 @@ if (!chrome) {
                 setTimeout(poll, 250);
               }; poll();
             })`, true);
-            if (!offlineReady) failures.push("offline: complete app installation never became ready");
+            if (!offlineReady) {
+              const detail = await ev(`(async () => JSON.stringify({ label: document.querySelector('#connectionLabel').textContent, detail: document.querySelector('#offlineDetail').textContent, notice: document.querySelector('#notice').textContent, errors: window.__bootErrors, workers: (await navigator.serviceWorker.getRegistrations()).map(r => ({ active: r.active?.state, installing: r.installing?.state, waiting: r.waiting?.state })), caches: await Promise.all((await caches.keys()).map(async name => ({ name, files: (await (await caches.open(name)).keys()).map(r => new URL(r.url).pathname) }))) }))()`, true);
+              failures.push("offline: complete app installation never became ready: " + detail);
+            }
             if (offlineReady) {
               await tab("Network.enable");
               await tab("Network.emulateNetworkConditions", { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 });

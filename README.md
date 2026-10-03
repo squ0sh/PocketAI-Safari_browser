@@ -1,6 +1,6 @@
 # Pocket AI
 
-> Private on-device chat for iPhone Safari · v0.8.0
+> Private on-device chat for iPhone Safari · v0.8.1
 
 Pocket AI runs supported local models using WebGPU. Its Bonsai GGUF file path works offline after the app has finished installing its support files. Online Assist is a separate, explicit remote option.
 
@@ -100,6 +100,12 @@ The Chromium probe does not establish real iPhone GPU compatibility. Before rele
 Tokenizer source and license information is recorded in [THIRD_PARTY.md](THIRD_PARTY.md).
 
 ## Version history
+
+### v0.8.1
+
+- Restore dependency constraints accidentally changed during the previous version bump, fixing Firebase CI installation.
+- Finish reading app assets before caching them to avoid tokenizer stream cache failures. Limit downloads to two concurrent files, retry failures, and retain completed files across interrupted installations. Model weights are never buffered or cached by this installer.
+- Add Repair offline setup, report missing files, and prevent stale readiness replies from overwriting current status.
 
 ### v0.8.0
 

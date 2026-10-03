@@ -231,6 +231,7 @@ const ABORTED = Symbol("pocket-ai-load-aborted");
 
 let chats = loadChats();
 let active = chats[0].id;
+let connectionRequest = 0;
 let lastHW = null;          // last inspect() result, for honest OOM messaging
 
 const $ = (s) => document.querySelector(s);
@@ -1831,13 +1832,16 @@ hydrateChatsFromIDB().finally(() => { hydrating = false; });
 
 if ("serviceWorker" in navigator && import.meta.env.PROD) {
   navigator.serviceWorker.addEventListener("controllerchange", refreshConnection);
+  navigator.serviceWorker.ready.then(refreshConnection);
   navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).then((registration) => {
+    registration.installing?.addEventListener("statechange", refreshConnection);
     registration.addEventListener("updatefound", () => {
       registration.installing?.addEventListener("statechange", refreshConnection);
     });
     refreshConnection();
   }).catch((e) => notifyUser("Offline installation could not finish: " + e.message));
 }
+window.addEventListener("offlineinstallationchange", refreshConnection);
 window.addEventListener("online", refreshConnection);
 window.addEventListener("offline", refreshConnection);
 
@@ -1904,16 +1908,18 @@ function notifyUser(message) {
 }
 
 async function refreshConnection() {
+  const request = ++connectionRequest;
   const local = !isOnlineModel();
   const label = $("#connectionLabel");
   label.textContent = local ? "On-device mode · checking offline setup…" : `${model().name} · messages and attached page leave this device`;
   const result = await offlineStatus();
+  if (request !== connectionRequest) return;
   // Use the current selection after the async status request finishes.
   const mode = isOnlineModel() ? `${model().name} · chat and page sent to your service` : "On-device mode · chat stays here";
-  label.textContent = mode + (navigator.onLine ? "" : " · no internet") + (result.ready ? " · App ready for offline GGUF" : " · Offline setup incomplete");
+  label.textContent = mode + (navigator.onLine ? "" : " · no internet") + (result.ready ? " · App ready for offline GGUF" : result.pending ? " · Preparing offline setup…" : " · Offline setup incomplete");
   $("#offlineDetail").textContent = result.ready
     ? "App, runtime and tokenizers are saved. You still need a compatible GGUF downloaded onto this device in Files."
-    : "The app's support files are not all saved yet. Keep this page open online, then use Update site and check again. Development previews do not install offline support.";
+    : (result.missing || []).join(" · ");
 }
 
 function pageTextFromHtml(html) {
@@ -1931,7 +1937,16 @@ $("#loadTools").onclick = () => {
   welcome.scrollIntoView({ block: "start" });
 };
 $("#setupButton").onclick = () => { refreshConnection(); $("#setupDialog").showModal(); };
-$("#refreshOffline").onclick = refreshConnection;
+$("#refreshOffline").onclick = async () => {
+  const button = $("#refreshOffline");
+  button.disabled = true;
+  $("#offlineDetail").textContent = "Saving offline files… Keep this page open online. This can take a few minutes.";
+  try {
+    const updating = await updateOfflineApp();
+    if (!updating) await refreshConnection();
+  } catch (error) { $("#offlineDetail").textContent = error.message; }
+  finally { button.disabled = false; }
+};
 $("#pageButton").onclick = () => {
   if (busy || hydrating) return notifyUser("Wait for the current operation before changing the page reference.");
   const source = chats.find((c) => c.id === active)?.source;
